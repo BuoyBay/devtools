@@ -1,0 +1,277 @@
+' Native Linux Studio development builder. Package and compiler subprocesses use argv.
+Import "buoydev/Common"
+Import studio_native_support
+Import crypto.Crypto
+
+Private Function NativeRoot() As String
+    Dim root As New FileSystemItem(DevCwd())
+    DevNeed(root.Child("apps/BuoyStudio/main.bui").IsFile(), "Run from assembled integration root; pass --root PATH otherwise")
+    Return root.FullPath()
+End Function
+
+Private Function Installed(name As String, compiler As String) As String
+    Dim folders As Array Of String = [DevEnvironment("BUOY_PACKAGES_DIR"), "/usr/share/buoy/packages", "/Applications/Buoy/packages", New FileSystemItem(compiler).ParentPath() + "/packages"]
+    For Each folder As String In folders
+        If folder <> "" Then
+            Dim file As String = Path.Join(folder, name)
+            If New FileSystemItem(file).IsFile() Then Return file
+        End If
+    Next
+    Return ""
+End Function
+
+Private Sub RequireNativeSlices(snapshot As String, name As String)
+    Dim manifest As JSONItem = DevLoad(Path.Join(snapshot, "manifest.json"))
+    Dim libraries As JSONItem = manifest.Value("libraries")
+    Dim triple As String = "x86_64-unknown-linux-gnu"
+    #If TargetArm Then
+        triple = "aarch64-unknown-linux-gnu"
+    #End If
+    For i As Integer = 0 To libraries.Count() - 1
+        Dim library As JSONItem = libraries.ValueAt(i)
+        If library.Value("system").AsBoolean().Or(False) Then Continue For
+        Dim platforms As JSONItem = library.Value("platforms")
+        If platforms.IsArray() Then
+            If Not DevHas(DevStrings(platforms), triple) Then Continue For
+        End If
+        Dim nativeName As String = DevString(library.Value("libName"), "native library name")
+        Dim runtime As String = Path.Join(snapshot, "runtime/" + triple + "/lib" + nativeName + ".so")
+        DevNeed(New FileSystemItem(runtime).IsFile(), "Missing public native slice for " + name + ": " + runtime + "; build that package from its public source first. No cached archive fallback is used.")
+    Next
+End Sub
+
+Private Function StagePackages(root As String, work As String, compiler As String, packager As String) As JSONItem
+    Dim names As Array Of String = ["controlsnapshot", "editorkit", "projectkit", "agentkit", "lspkit", "processkit", "agentsession", "chatkit", "layoutkit", "layoutcanvas", "guilintkit", "previewkit", "terminalkit", "githubkit", "forgejokit", "atomicfilekit", "progresskit", "fontkit", "diffkit", "gitkit", "fuzzyfind", "keychain", "secretstore", "maskkit", "desktopmenus", "modelkit", "chatgptauth"]
+    Dim seals As JSONItem = JSONItem.NewArray()
+    For Each name As String In names
+        Dim archive As String = name + "-0.1.0.buipkg"
+        Dim destination As String = Path.Join(work, "packages/" + archive)
+        DevMkdir(Path.Join(work, "packages"))
+        Dim snapshot As String = Path.Join(work, "package-sources/" + name)
+        Dim source As String = Path.Join(root, "libraries/" + name)
+        StudioNativeCopy(Path.Join(source, "manifest.json"), Path.Join(snapshot, "manifest.json"))
+        For Each directory As String In ["modules", "resources", "runtime", "link"]
+            If New FileSystemItem(Path.Join(source, directory)).IsFolder() Then StudioNativeTree(Path.Join(source, directory), Path.Join(snapshot, directory))
+        Next
+        RequireNativeSlices(snapshot, name)
+        Dim receipt As JSONItem = JSONItem.NewObject()
+        receipt.Value("package") = archive
+        receipt.Value("mode") = "private-source-seal"
+        receipt.Value("scope") = "Copied manifest, modules, resources, and existing native runtime/link slices; native slices are not rebuilt or certified by this builder."
+        receipt.Value("inputs") = StudioNativeInputs(snapshot)
+        StudioNativeRun([packager, "pkg", "seal", snapshot, "-o", destination], work)
+        StudioNativeStore(destination)
+        receipt.Value("packageSha256") = StudioNativeHash(destination)
+        seals.Add(receipt)
+    Next
+    For Each archive As String In ["crypto-1.0.0.buipkg", "fluenticons-1.0.0.buipkg", "regex-1.0.0.buipkg"]
+        Dim source As String = Installed(archive, compiler)
+        DevNeed(source <> "", "Missing installed SDK package: " + archive)
+        StudioNativeCopy(source, Path.Join(work, "packages/" + archive))
+    Next
+    Return seals
+End Function
+
+Private Sub StageSources(root As String, work As String, resources As JSONItem)
+    For Each item As FileSystemItem In New FileSystemItem(Path.Join(root, "apps/BuoyStudio")).Children()
+        If item.IsFile() And item.Ext() = "bui" Then StudioNativeCopy(item.FullPath(), Path.Join(work, item.Name()))
+    Next
+    StudioNativeCopy(Path.Join(root, "apps/shared/snippets/SnippetTemplates.bui"), Path.Join(work, "SnippetTemplates.bui"))
+    For Each component As String In ["treeview/treeview", "searchfield/searchfield", "segmentedbutton/segmentedbutton", "contextmenu/gtkcontextmenu", "textinput/textmodel", "textinput/textinputcanvas", "textinput/inputbridge", "textinput/nativewindows", "textinput/nativemacos"]
+        Dim source As New FileSystemItem(Path.Join(root, "containers/integrations/" + component + ".bui"))
+        StudioNativeCopy(source.FullPath(), Path.Join(work, source.Name()))
+    Next
+    For Each helper As String In ["discover_layout_packages.py", "studio_debug_adapter.py", "discover_documentation.py"]
+        StudioNativeResource(resources, root, work, "tools/" + helper, helper)
+    Next
+    StudioNativeResource(resources, root, work, "apps/BuoyStudio/documentation.html", "documentation.html")
+    StudioNativeResource(resources, root, work, "apps/BuoyStudio/docs/BUOYSCRIPT.md", "studio-script-primer.md")
+    StudioNativeResource(resources, root, work, "apps/BuoyStudio/resources/unicode-LICENSE.txt", "unicode-LICENSE.txt")
+    StudioNativeResource(resources, root, work, "apps/BuoyDocs/snapshot/docs.json", "documentation-upstream.json")
+    For Each notice As String In ["SCOWL-LICENSE.txt", "CSPELL-LICENSE.txt"]
+        StudioNativeResource(resources, root, work, "apps/BuoyStudio/spelling/" + notice, notice)
+    Next
+    For Each item As FileSystemItem In New FileSystemItem(Path.Join(root, "apps/BuoyStudio/resources/glyphs")).Children()
+        If item.IsFile() And (item.Ext() = "png" Or item.Ext() = "ico") Then StudioNativeResource(resources, root, work, "apps/BuoyStudio/resources/glyphs/" + item.Name(), item.Name())
+    Next
+    StudioNativeCopy(Path.Join(work, "packages/previewkit-0.1.0.buipkg"), Path.Join(work, "resources/studio-previewkit-0.1.0.buipkg"))
+    Dim preview As JSONItem = JSONItem.NewObject()
+    preview.Value("kind") = "Resource"
+    preview.Value("path") = "studio-previewkit-0.1.0.buipkg"
+    resources.Add(preview)
+    For Each pair As String In ["Mac:icns", "Windows:ico", "Linux:png"]
+        Dim fields As Array Of String = String.Split(pair, ":")
+        Dim name As String = "AppIcon." + fields(1)
+        StudioNativeCopy(Path.Join(root, "apps/BuoyStudio/resources/" + name), Path.Join(work, "resources/" + name))
+        Dim icon As JSONItem = JSONItem.NewObject()
+        icon.Value("kind") = "AppIcon"
+        icon.Value("path") = name
+        icon.Value("platforms") = DevArray([fields(0)])
+        resources.Add(icon)
+    Next
+End Sub
+
+Private Sub BuildGlue(root As String, work As String, cc As String, resources As JSONItem)
+    StudioNativeRun([cc, "-std=c11", "-O2", "-U_FORTIFY_SOURCE", "-D_FORTIFY_SOURCE=0", "-fPIC", "-c", Path.Join(root, "apps/BuoyStudio/StudioShellTerminal.c"), "-o", Path.Join(work, "studio-shell-terminal.o")], work)
+    StudioNativeRun([cc, "-std=c11", "-O2", "-U_FORTIFY_SOURCE", "-D_FORTIFY_SOURCE=0", "-Wall", "-Wextra", "-Werror", "-fPIC", "-c", Path.Join(root, "libraries/gtklifecycle/native/gtk_lifecycle.c"), "-o", Path.Join(work, "resources/studio-gtk-lifecycle.o")], work)
+    Dim entry As JSONItem = JSONItem.NewObject()
+    entry.Value("kind") = "Resource"
+    entry.Value("path") = "studio-gtk-lifecycle.o"
+    resources.Add(entry)
+End Sub
+
+Private Sub BuildIdentity(work As String, target As String, compiler As String, packager As String, resources As JSONItem)
+    Dim manifest As JSONItem = JSONItem.NewObject()
+    manifest.Value("schema") = 1.0
+    manifest.Value("resources") = resources
+    DevWrite(Path.Join(work, "resources/app_resources.json"), Json.Stringify(manifest))
+    Dim inputs As JSONItem = JSONItem.NewArray()
+    For Each relative As String In StudioNativeFiles(work)
+        If Not String.StartsWith(relative, "package-sources/") Then
+            Dim entry As JSONItem = JSONItem.NewObject()
+            entry.Value("path") = relative
+            entry.Value("sha256") = StudioNativeHash(Path.Join(work, relative))
+            inputs.Add(entry)
+        End If
+    Next
+    Dim info As JSONItem = JSONItem.NewObject()
+    Dim fingerprint As String = Crypto.Hash(Crypto.HashAlgorithms.SHA256, Bytes.FromString(Json.Stringify(inputs), Text.Encodings.UTF8)).ToHex()
+    info.Value("schema") = 1.0
+    info.Value("application") = "Buoy Studio"
+    info.Value("version") = "native-development"
+    info.Value("credentialProfile") = "production"
+    info.Value("builtAtUtc") = DateTime.Now(TimeZone.Utc).ToIso8601()
+    info.Value("buildId") = "native-" + String.Left(fingerprint, 12)
+    info.Value("sourceFingerprint") = fingerprint
+    info.Value("fingerprintScope") = "Sorted staged source, packages, resources, normalized manifest and native link inputs; excludes source snapshots, generated identity and output. Native builder schema; not Python fingerprint compatibility."
+    info.Value("target") = target
+    info.Value("buildOS") = "Linux"
+    info.Value("git") = JSONItem.NewObject()
+    info.Value("inputs") = inputs
+    Dim packages As JSONItem = JSONItem.NewArray()
+    For Each relative As String In StudioNativeFiles(Path.Join(work, "packages"))
+        Dim packageInfo As JSONItem = JSONItem.NewObject()
+        packageInfo.Value("file") = relative
+        packageInfo.Value("sha256") = StudioNativeHash(Path.Join(work, "packages/" + relative))
+        packages.Add(packageInfo)
+    Next
+    info.Value("packages") = packages
+    For Each role As String In ["compiler", "packager"]
+        Dim executable As String = compiler
+        If role = "packager" Then executable = packager
+        Dim metadata As JSONItem = JSONItem.NewObject()
+        metadata.Value("version") = String.Trim(StudioNativeRun([executable, "--version"], work))
+        metadata.Value("path") = executable
+        metadata.Value("sha256") = StudioNativeHash(executable)
+        info.Value(role) = metadata
+    Next
+    DevWrite(Path.Join(work, "resources/studio-build-info.json"), Json.Stringify(info))
+    Dim resource As JSONItem = JSONItem.NewObject()
+    resource.Value("kind") = "Resource"
+    resource.Value("path") = "studio-build-info.json"
+    resources.Add(resource)
+    DevWrite(Path.Join(work, "resources/app_resources.json"), Json.Stringify(manifest))
+End Sub
+
+Function Main(args As Array Of String) As Integer
+    Dim work As String = ""
+    Try
+        Dim root As String = ""
+        Dim compiler As String = DevEnvironment("BUOY", "/usr/bin/buoy")
+        Dim packager As String = DevEnvironment("BPM_PACKAGER", "/usr/bin/buoy")
+        Dim cc As String = DevEnvironment("CC", "cc")
+        Dim output As String = ""
+        Dim checkOnly As Boolean = False
+        Dim keep As Boolean = False
+        Dim i As Integer = 1
+        While i < args.Count
+            Select Case args(i)
+                Case "--help"
+                    Print "Native Linux host Studio builder: --root PATH --compiler EXE --packager EXE --cc EXE --output PATH --check-only --keep-work"
+                    Print "Production credential profile; fresh private package seals; all six-target semantic checks. Release, self-test, cross-build and script-runner deployment are pending migration."
+                    Return 0
+                Case "--check-only"
+                    checkOnly = True
+                Case "--keep-work"
+                    keep = True
+                Case "--root", "--compiler", "--packager", "--cc", "--output"
+                    DevNeed(i + 1 < args.Count, "Missing option value: " + args(i))
+                    Select Case args(i)
+                        Case "--root"
+                            root = DevAbsolute(args(i + 1))
+                        Case "--compiler"
+                            compiler = args(i + 1)
+                        Case "--packager"
+                            packager = args(i + 1)
+                        Case "--cc"
+                            cc = args(i + 1)
+                        Case "--output"
+                            output = DevAbsolute(args(i + 1))
+                    End Select
+                    i += 1
+                Case Else
+                    Throw New InvalidArgumentException("Unsupported native option: " + args(i) + "; use --help for working scope")
+            End Select
+            i += 1
+        End While
+        #If Not TargetLinux Then
+            Throw New UnsupportedOperationException("Native Studio builder currently supports Linux host builds; macOS/Windows staging is pending migration")
+        #End If
+        If root = "" Then root = NativeRoot()
+        compiler = DevWhich(compiler)
+        packager = DevWhich(packager)
+        cc = DevWhich(cc)
+        DevNeed(compiler <> "" And packager <> "" And cc <> "", "Compiler, packager and C compiler must be executable paths or PATH names")
+        DevNeed(compiler <> "/usr/local/bin/buoy", "Pass --compiler /usr/bin/buoy to invoke the Linux compiler directly, without its shell launcher")
+        If output = "" Then output = Path.Join(root, "dist/BuoyStudio/BuoyStudio")
+        DevMkdir(Path.Join(root, "dist"))
+        work = DevTemp("studio-native-", Path.Join(root, "dist"))
+        Print "Staging native Studio in " + work
+        Dim seals As JSONItem = StagePackages(root, work, compiler, packager)
+        Dim resources As JSONItem = JSONItem.NewArray()
+        StageSources(root, work, resources)
+        Dim receipt As JSONItem = JSONItem.NewObject()
+        receipt.Value("sourceSeals") = seals
+        DevWrite(Path.Join(work, "resources/studio-package-sources.json"), Json.Stringify(receipt))
+        Dim sourceResource As JSONItem = JSONItem.NewObject()
+        sourceResource.Value("kind") = "Resource"
+        sourceResource.Value("path") = "studio-package-sources.json"
+        resources.Add(sourceResource)
+        BuildGlue(root, work, cc, resources)
+        Dim target As String = StudioNativeTarget()
+        BuildIdentity(work, target, compiler, packager, resources)
+        For Each checkTarget As String In ["arm64-darwin", "x86_64-darwin", "arm64-linux", "x86_64-linux", "arm64-windows", "x86_64-windows"]
+            Dim argv As Array Of String = StudioNativeCompilerArgs(compiler, checkTarget)
+            For Each arg As String In ["main.bui", "--check", "--diagnostic-format", "json", "--target", checkTarget]
+                Array.Append(argv, arg)
+            Next
+            Dim diagnostics As JSONItem = Json.Parse(StudioNativeRun(argv, work, 180.0))
+            DevNeed(diagnostics.Value("errors").IsArray() And diagnostics.Value("errors").Count() = 0, "Studio diagnostics failed for " + checkTarget + ": " + Json.Stringify(diagnostics))
+            If diagnostics.Value("warnings").Count() > 0 Then Print Json.Stringify(diagnostics.Value("warnings"))
+            Print "Studio semantic checks passed: " + checkTarget
+        Next
+        Print "BuoyScript SDK helper deployment is pending the native port; script settings will report missing helper."
+        If Not checkOnly Then
+            DevMkdir(New FileSystemItem(output).ParentPath())
+            Dim argv As Array Of String = StudioNativeCompilerArgs(compiler, target)
+            For Each arg As String In ["main.bui", "--target", target, "--app-type", "desktop", "-o", output, "--extra-obj", Path.Join(work, "studio-shell-terminal.o"), "--extra-obj", Path.Join(work, "resources/studio-gtk-lifecycle.o")]
+                Array.Append(argv, arg)
+            Next
+            ' GTK development symlink is not assumed: copy the actual host SONAME.
+            Dim gtk As String = String.Trim(StudioNativeRun([cc, "-print-file-name=libgtk-4.so.1"], work))
+            DevNeed(New FileSystemItem(gtk).IsFile(), "GTK 4 runtime library not found: " + gtk)
+            DevMkdir(Path.Join(work, "native-link"))
+            DevNeed(New FileSystemItem(gtk).CopyTo(New FileSystemItem(Path.Join(work, "native-link/libgtk-4.so"))), "Cannot stage GTK 4 link input")
+            Array.Append(argv, "-L")
+            Array.Append(argv, Path.Join(work, "native-link"))
+            StudioNativeRun(argv, work, 600.0)
+            Print "Built native Studio: " + output
+        End If
+        If Not keep Then DevRemoveTree(work)
+        Return 0
+    Catch error As Exception
+        StdErr.WriteLine("build_studio: " + error.Message)
+        If work <> "" Then StdErr.WriteLine("Build evidence retained: " + work)
+        Return 1
+    End Try
+End Function

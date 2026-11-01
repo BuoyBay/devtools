@@ -1,0 +1,555 @@
+{
+  "schema": 1,
+  "recipes": {
+    "fuzzyfind": {
+      "kind": "package",
+      "path": "libraries/fuzzyfind",
+      "needs": [],
+      "inputs": [
+        "libraries/fuzzyfind/manifest.json",
+        "libraries/fuzzyfind/modules/**/*.bui",
+        "libraries/fuzzyfind/resources/buoy-docs/api.md",
+        "libraries/fuzzyfind/resources/buoy-docs/getting-started.md",
+        "libraries/fuzzyfind/resources/buoy-docs/index.md",
+        "libraries/fuzzyfind/resources/buoy-docs/typed-api.md"
+      ]
+    },
+    "editorkit": {
+      "kind": "package",
+      "path": "libraries/editorkit",
+      "needs": [],
+      "inputs": [
+        "libraries/editorkit/manifest.json",
+        "libraries/editorkit/modules/**/*.bui",
+        "libraries/editorkit/resources/buoy-docs/api.md",
+        "libraries/editorkit/resources/buoy-docs/getting-started.md",
+        "libraries/editorkit/resources/buoy-docs/index.md",
+        "libraries/editorkit/resources/buoy-docs/typed-api.md"
+      ]
+    },
+    "diffkit": {
+      "kind": "package",
+      "path": "libraries/diffkit",
+      "needs": [],
+      "inputs": [
+        "libraries/diffkit/manifest.json",
+        "libraries/diffkit/modules/**/*.bui",
+        "libraries/diffkit/resources/buoy-docs/api.md",
+        "libraries/diffkit/resources/buoy-docs/getting-started.md",
+        "libraries/diffkit/resources/buoy-docs/index.md",
+        "libraries/diffkit/resources/buoy-docs/typed-api.md"
+      ]
+    },
+    "lspkit": {
+      "kind": "package",
+      "path": "libraries/lspkit",
+      "needs": [],
+      "inputs": [
+        "libraries/lspkit/manifest.json",
+        "libraries/lspkit/modules/**/*.bui",
+        "libraries/lspkit/resources/buoy-docs/api.md",
+        "libraries/lspkit/resources/buoy-docs/getting-started.md",
+        "libraries/lspkit/resources/buoy-docs/index.md",
+        "libraries/lspkit/resources/buoy-docs/typed-api.md"
+      ]
+    },
+    "buildkit": {
+      "kind": "package",
+      "path": "libraries/buildkit",
+      "needs": [],
+      "inputs": [
+        "libraries/buildkit/manifest.json",
+        "libraries/buildkit/modules/**/*.bui",
+        "libraries/buildkit/resources/buoy-docs/api.md",
+        "libraries/buildkit/resources/buoy-docs/getting-started.md",
+        "libraries/buildkit/resources/buoy-docs/index.md",
+        "libraries/buildkit/resources/buoy-docs/typed-api.md"
+      ]
+    },
+    "testkit": {
+      "kind": "package",
+      "path": "libraries/testkit",
+      "needs": [],
+      "inputs": [
+        "libraries/testkit/manifest.json",
+        "libraries/testkit/modules/**/*.bui",
+        "libraries/testkit/resources/buoy-docs/api.md",
+        "libraries/testkit/resources/buoy-docs/getting-started.md",
+        "libraries/testkit/resources/buoy-docs/index.md",
+        "libraries/testkit/resources/buoy-docs/typed-api.md"
+      ]
+    },
+    "projectkit": {
+      "kind": "package",
+      "path": "libraries/projectkit",
+      "needs": [
+        "editorkit"
+      ],
+      "inputs": [
+        "libraries/projectkit/manifest.json",
+        "libraries/projectkit/modules/**/*.bui",
+        "libraries/projectkit/resources/buoy-docs/api.md",
+        "libraries/projectkit/resources/buoy-docs/getting-started.md",
+        "libraries/projectkit/resources/buoy-docs/index.md",
+        "libraries/projectkit/resources/buoy-docs/typed-api.md"
+      ]
+    },
+    "agentkit": {
+      "kind": "package",
+      "path": "libraries/agentkit",
+      "needs": [],
+      "inputs": [
+        "libraries/agentkit/manifest.json",
+        "libraries/agentkit/modules/**/*.bui",
+        "libraries/agentkit/resources/buoy-docs/api.md",
+        "libraries/agentkit/resources/buoy-docs/getting-started.md",
+        "libraries/agentkit/resources/buoy-docs/index.md",
+        "libraries/agentkit/resources/buoy-docs/typed-api.md"
+      ]
+    },
+    "agentsession": {
+      "kind": "package",
+      "path": "libraries/agentsession",
+      "needs": [
+        "agentkit",
+        "processkit",
+        "projectkit"
+      ],
+      "inputs": [
+        "libraries/agentsession/manifest.json",
+        "libraries/agentsession/modules/**/*.bui",
+        "libraries/agentsession/resources/buoy-docs/api.md",
+        "libraries/agentsession/resources/buoy-docs/getting-started.md",
+        "libraries/agentsession/resources/buoy-docs/index.md",
+        "libraries/agentsession/resources/buoy-docs/typed-api.md"
+      ]
+    },
+    "chatkit": {
+      "kind": "package",
+      "path": "libraries/chatkit",
+      "needs": [
+        "agentsession"
+      ],
+      "inputs": [
+        "libraries/chatkit/manifest.json",
+        "libraries/chatkit/modules/**/*.bui",
+        "libraries/chatkit/resources/buoy-docs/api.md",
+        "libraries/chatkit/resources/buoy-docs/getting-started.md",
+        "libraries/chatkit/resources/buoy-docs/index.md",
+        "libraries/chatkit/resources/buoy-docs/typed-api.md"
+      ]
+    },
+    "modelkit": {
+      "kind": "package",
+      "path": "libraries/modelkit",
+      "needs": [],
+      "inputs": [
+        "libraries/modelkit/manifest.json",
+        "libraries/modelkit/modules/**/*.bui",
+        "libraries/modelkit/resources/buoy-docs/api.md",
+        "libraries/modelkit/resources/buoy-docs/getting-started.md",
+        "libraries/modelkit/resources/buoy-docs/index.md",
+        "libraries/modelkit/resources/buoy-docs/typed-api.md"
+      ]
+    },
+    "githubkit": {
+      "kind": "package",
+      "path": "libraries/githubkit",
+      "needs": [],
+      "inputs": [
+        "libraries/githubkit/manifest.json",
+        "libraries/githubkit/modules/**/*.bui",
+        "libraries/githubkit/resources/buoy-docs/api.md",
+        "libraries/githubkit/resources/buoy-docs/getting-started.md",
+        "libraries/githubkit/resources/buoy-docs/index.md",
+        "libraries/githubkit/resources/buoy-docs/typed-api.md"
+      ]
+    },
+    "forgejokit": {
+      "kind": "package",
+      "path": "libraries/forgejokit",
+      "needs": [],
+      "inputs": [
+        "libraries/forgejokit/manifest.json",
+        "libraries/forgejokit/modules/**/*.bui",
+        "libraries/forgejokit/resources/buoy-docs/api.md",
+        "libraries/forgejokit/resources/buoy-docs/getting-started.md",
+        "libraries/forgejokit/resources/buoy-docs/index.md",
+        "libraries/forgejokit/resources/buoy-docs/typed-api.md"
+      ]
+    },
+    "layoutkit": {
+      "kind": "package",
+      "path": "libraries/layoutkit",
+      "needs": [
+        "editorkit"
+      ],
+      "inputs": [
+        "libraries/layoutkit/manifest.json",
+        "libraries/layoutkit/modules/**/*.bui",
+        "libraries/layoutkit/resources/buoy-docs/api.md",
+        "libraries/layoutkit/resources/buoy-docs/getting-started.md",
+        "libraries/layoutkit/resources/buoy-docs/index.md",
+        "libraries/layoutkit/resources/buoy-docs/typed-api.md"
+      ],
+      "checks": [
+        "modules/LayoutCatalog.bui",
+        "modules/LayoutDiscovery.bui",
+        "modules/LayoutDocument.bui",
+        "modules/LayoutRefactor.bui",
+        "modules/LayoutRelations.bui"
+      ]
+    },
+    "layoutcanvas": {
+      "kind": "package",
+      "path": "libraries/layoutcanvas",
+      "needs": [
+        "layoutkit",
+        "controlsnapshot"
+      ],
+      "inputs": [
+        "libraries/layoutcanvas/manifest.json",
+        "libraries/layoutcanvas/modules/**/*.bui",
+        "libraries/layoutcanvas/resources/buoy-docs/api.md",
+        "libraries/layoutcanvas/resources/buoy-docs/getting-started.md",
+        "libraries/layoutcanvas/resources/buoy-docs/index.md",
+        "libraries/layoutcanvas/resources/buoy-docs/typed-api.md"
+      ],
+      "checks": [
+        "modules/LayoutCanvas.bui",
+        "modules/LayoutCanvasNative.bui",
+        "modules/LayoutCanvasWheel.bui"
+      ]
+    },
+    "guilintkit": {
+      "kind": "package",
+      "path": "libraries/guilintkit",
+      "needs": [
+        "layoutkit"
+      ],
+      "inputs": [
+        "libraries/guilintkit/manifest.json",
+        "libraries/guilintkit/modules/**/*.bui",
+        "libraries/guilintkit/resources/buoy-docs/api.md",
+        "libraries/guilintkit/resources/buoy-docs/getting-started.md",
+        "libraries/guilintkit/resources/buoy-docs/index.md",
+        "libraries/guilintkit/resources/buoy-docs/rules.md",
+        "libraries/guilintkit/resources/buoy-docs/typed-api.md"
+      ],
+      "bundled_packages": [
+        "crypto"
+      ]
+    },
+    "previewkit": {
+      "kind": "package",
+      "path": "libraries/previewkit",
+      "needs": [],
+      "inputs": [
+        "libraries/previewkit/manifest.json",
+        "libraries/previewkit/modules/**/*.bui",
+        "libraries/previewkit/resources/buoy-docs/api.md",
+        "libraries/previewkit/resources/buoy-docs/getting-started.md",
+        "libraries/previewkit/resources/buoy-docs/index.md",
+        "libraries/previewkit/resources/buoy-docs/typed-api.md"
+      ]
+    },
+    "atomicfilekit": {
+      "kind": "package",
+      "path": "libraries/atomicfilekit",
+      "needs": [],
+      "inputs": [
+        "libraries/atomicfilekit/manifest.json",
+        "libraries/atomicfilekit/modules/**/*.bui",
+        "libraries/atomicfilekit/resources/buoy-docs/api.md",
+        "libraries/atomicfilekit/resources/buoy-docs/getting-started.md",
+        "libraries/atomicfilekit/resources/buoy-docs/index.md",
+        "libraries/atomicfilekit/resources/buoy-docs/typed-api.md"
+      ]
+    },
+    "progresskit": {
+      "kind": "package",
+      "path": "libraries/progresskit",
+      "needs": [],
+      "inputs": [
+        "libraries/progresskit/manifest.json",
+        "libraries/progresskit/modules/**/*.bui",
+        "libraries/progresskit/resources/buoy-docs/api.md",
+        "libraries/progresskit/resources/buoy-docs/getting-started.md",
+        "libraries/progresskit/resources/buoy-docs/index.md",
+        "libraries/progresskit/resources/buoy-docs/typed-api.md"
+      ]
+    },
+    "processkit": {
+      "kind": "command",
+      "argv": [
+        "{python}",
+        "tools/build_processkit.py"
+      ],
+      "inputs": [
+        "tools/build_processkit.py",
+        "libraries/processkit/manifest.json",
+        "libraries/processkit/modules/**/*.bui",
+        "libraries/processkit/native/*.*"
+      ],
+      "outputs": [
+        "packages/processkit-0.1.0.buipkg",
+        "dist/processkit-0.1.0.buipkg"
+      ],
+      "timeout": 600,
+      "check_argv": [
+        "{python}",
+        "tools/build_processkit.py",
+        "--check-only"
+      ],
+      "check_all_targets": true
+    },
+    "terminalkit": {
+      "kind": "command",
+      "argv": [
+        "{python}",
+        "tools/build_terminalkit.py"
+      ],
+      "inputs": [
+        "tools/build_terminalkit.py",
+        "libraries/terminalkit/manifest.json",
+        "libraries/terminalkit/modules/**/*.bui",
+        "libraries/terminalkit/native/*.*"
+      ],
+      "outputs": [
+        "packages/terminalkit-0.1.0.buipkg",
+        "dist/terminalkit-0.1.0.buipkg"
+      ],
+      "timeout": 600,
+      "check_argv": [
+        "{python}",
+        "tools/build_terminalkit.py",
+        "--check-only"
+      ],
+      "check_all_targets": true
+    },
+    "fontkit": {
+      "kind": "command",
+      "argv": [
+        "{python}",
+        "tools/build_fontkit.py"
+      ],
+      "inputs": [
+        "tools/build_fontkit.py",
+        "libraries/fontkit/manifest.json",
+        "libraries/fontkit/modules/**/*.bui",
+        "libraries/fontkit/native/*.*"
+      ],
+      "outputs": [
+        "packages/fontkit-0.1.0.buipkg",
+        "dist/fontkit-0.1.0.buipkg"
+      ],
+      "timeout": 600,
+      "check_argv": [
+        "{python}",
+        "tools/build_fontkit.py",
+        "--check-only"
+      ],
+      "check_all_targets": true
+    },
+    "studio": {
+      "kind": "command",
+      "needs": [
+        "editorkit",
+        "projectkit",
+        "agentkit",
+        "processkit",
+        "agentsession",
+        "chatkit",
+        "layoutkit",
+        "layoutcanvas",
+        "guilintkit",
+        "previewkit",
+        "terminalkit",
+        "githubkit",
+        "forgejokit",
+        "atomicfilekit",
+        "progresskit",
+        "fontkit",
+        "diffkit",
+        "gitkit",
+        "fuzzyfind",
+        "modelkit",
+        "chatgptauth",
+        "keychain",
+        "secretstore",
+        "maskkit",
+        "controlsnapshot"
+      ],
+      "argv": [
+        "{python}",
+        "tools/build_studio.py",
+        "--output",
+        "{root}/dist/build/studio/{target}/{profile}/BuoyStudio{application-suffix}",
+        "--sealed-packages-only",
+        "--profile",
+        "{profile}"
+      ],
+      "check_argv": [
+        "{python}",
+        "tools/build_studio.py",
+        "--check-only",
+        "--sealed-packages-only",
+        "--profile",
+        "{profile}"
+      ],
+      "check_all_targets": true,
+      "inputs": [
+        "tools/build_studio.py",
+        "tools/development_permissions.py",
+        "apps/shared/development/*.bui",
+        "apps/BuoyStudio/*.bui",
+        "apps/BuoyStudio/StudioShellTerminal.c",
+        "apps/BuoyStudio/documentation.html",
+        "apps/BuoyDocs/snapshot/docs.json",
+        "apps/shared/snippets/*.bui",
+        "containers/integrations/treeview/*.bui",
+        "containers/integrations/searchfield/*.bui",
+        "containers/integrations/segmentedbutton/*.bui",
+        "containers/integrations/contextmenu/*.bui",
+        "containers/integrations/textinput/*.bui",
+        "tools/build_gtklifecycle.py",
+        "libraries/gtklifecycle/native/*",
+        "tools/studio_build_info.py",
+        "tools/studio_debug_adapter.py",
+        "tools/discover_layout_packages.py",
+        "tools/discover_documentation.py",
+        "apps/BuoyStudio/resources/*.*",
+        "apps/BuoyStudio/resources/glyphs/*.png",
+        "apps/BuoyStudio/resources/glyphs/*.ico"
+      ],
+      "outputs": [
+        "dist/build/studio/{target}/{profile}"
+      ],
+      "timeout": 1800
+    },
+    "devtools": {
+      "kind": "group",
+      "needs": [
+        "fuzzyfind",
+        "editorkit",
+        "diffkit",
+        "lspkit",
+        "buildkit",
+        "testkit",
+        "projectkit",
+        "agentkit",
+        "agentsession",
+        "chatkit",
+        "modelkit",
+        "githubkit",
+        "forgejokit",
+        "layoutkit",
+        "layoutcanvas",
+        "guilintkit",
+        "previewkit",
+        "atomicfilekit",
+        "progresskit"
+      ]
+    },
+    "gitkit": {
+      "kind": "command",
+      "argv": [
+        "{python}",
+        "tools/build_gitkit.py"
+      ],
+      "inputs": [
+        "tools/build_gitkit.py",
+        "libraries/gitkit/manifest.json",
+        "libraries/gitkit/modules/*.bui",
+        "libraries/gitkit/native/*.*"
+      ],
+      "outputs": [
+        "packages/gitkit-0.1.0.buipkg",
+        "dist/gitkit-0.1.0.buipkg"
+      ],
+      "timeout": 1800,
+      "check_argv": [
+        "{python}",
+        "tools/build_gitkit.py",
+        "--check-only"
+      ],
+      "check_all_targets": true
+    },
+    "chatgptauth": {
+      "kind": "command",
+      "argv": [
+        "{python}",
+        "tools/build_chatgptauth.py"
+      ],
+      "check_argv": [
+        "{python}",
+        "tools/build_chatgptauth.py",
+        "--check-only"
+      ],
+      "check_all_targets": true,
+      "inputs": [
+        "tools/build_chatgptauth.py",
+        "tools/build_support.py",
+        "libraries/chatgptauth/manifest.json",
+        "libraries/chatgptauth/modules/**/*.bui",
+        "libraries/chatgptauth/native/*"
+      ],
+      "outputs": [
+        "packages/chatgptauth-0.1.0.buipkg",
+        "dist/chatgptauth-0.1.0.buipkg"
+      ]
+    },
+    "keychain": {
+      "kind": "package",
+      "path": "libraries/keychain",
+      "inputs": [
+        "libraries/keychain/manifest.json",
+        "libraries/keychain/modules/**/*.bui",
+        "libraries/keychain/resources/buoy-docs/api.md",
+        "libraries/keychain/resources/buoy-docs/getting-started.md",
+        "libraries/keychain/resources/buoy-docs/index.md",
+        "libraries/keychain/resources/buoy-docs/typed-api.md",
+        "libraries/keychain/link/**/*.tbd"
+      ]
+    },
+    "secretstore": {
+      "kind": "package",
+      "path": "libraries/secretstore",
+      "inputs": [
+        "libraries/secretstore/manifest.json",
+        "libraries/secretstore/modules/**/*.bui",
+        "libraries/secretstore/resources/buoy-docs/api.md",
+        "libraries/secretstore/resources/buoy-docs/index.md"
+      ],
+      "needs": [
+        "keychain"
+      ],
+      "bundled_packages": [
+        "crypto"
+      ]
+    },
+    "maskkit": {
+      "kind": "package",
+      "path": "libraries/maskkit",
+      "inputs": [
+        "libraries/maskkit/manifest.json",
+        "libraries/maskkit/modules/**/*.bui",
+        "libraries/maskkit/resources/buoy-docs/api.md",
+        "libraries/maskkit/resources/buoy-docs/getting-started.md",
+        "libraries/maskkit/resources/buoy-docs/index.md",
+        "libraries/maskkit/resources/buoy-docs/typed-api.md"
+      ]
+    },
+    "controlsnapshot": {
+      "kind": "package",
+      "path": "libraries/controlsnapshot",
+      "inputs": [
+        "libraries/controlsnapshot/manifest.json",
+        "libraries/controlsnapshot/modules/**/*.bui"
+      ],
+      "checks": [
+        "modules/ControlSnapshot.bui"
+      ]
+    }
+  }
+}

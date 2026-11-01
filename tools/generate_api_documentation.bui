@@ -1,0 +1,825 @@
+' Source-derived public API documentation. Run with ahoy; Python is not required.
+Import helper_runtime As H
+
+Function S(item As JSONItem, key As String) As String
+    Return item.Value(key).AsString().Or("")
+End Function
+
+#If TargetLinux Then
+#If TargetIntel Then
+Declare Function PCCompile Lib "libpcre2-8.so.0" Alias "pcre2_compile_8" (pattern As String, length As Integer, options As UInt32, ByRef errorCode As Int32, ByRef errorOffset As Integer, context As Ptr) As Ptr
+Declare Function PCData Lib "libpcre2-8.so.0" Alias "pcre2_match_data_create_from_pattern_8" (compiled As Ptr, context As Ptr) As Ptr
+Declare Function PCMatch Lib "libpcre2-8.so.0" Alias "pcre2_match_8" (compiled As Ptr, subject As String, length As Integer, offset As Integer, options As UInt32, data As Ptr, context As Ptr) As Int32
+Declare Function PCSubstring Lib "libpcre2-8.so.0" Alias "pcre2_substring_get_bynumber_8" (data As Ptr, number As UInt32, ByRef buffer As Ptr, ByRef length As Integer) As Int32
+Declare Sub PCFreeString Lib "libpcre2-8.so.0" Alias "pcre2_substring_free_8" (buffer As Ptr)
+Declare Sub PCFreeData Lib "libpcre2-8.so.0" Alias "pcre2_match_data_free_8" (data As Ptr)
+Declare Sub PCFree Lib "libpcre2-8.so.0" Alias "pcre2_code_free_8" (compiled As Ptr)
+
+#Else
+Declare Function PCCompile Lib "libpcre2-8.so.0" Alias "pcre2_compile_8" (pattern As String, length As Integer, options As UInt32, ByRef errorCode As Int32, ByRef errorOffset As Integer, context As Ptr) As Ptr
+Declare Function PCData Lib "libpcre2-8.so.0" Alias "pcre2_match_data_create_from_pattern_8" (compiled As Ptr, context As Ptr) As Ptr
+Declare Function PCMatch Lib "libpcre2-8.so.0" Alias "pcre2_match_8" (compiled As Ptr, subject As String, length As Integer, offset As Integer, options As UInt32, data As Ptr, context As Ptr) As Int32
+Declare Function PCSubstring Lib "libpcre2-8.so.0" Alias "pcre2_substring_get_bynumber_8" (data As Ptr, number As UInt32, ByRef buffer As Ptr, ByRef length As Integer) As Int32
+Declare Sub PCFreeString Lib "libpcre2-8.so.0" Alias "pcre2_substring_free_8" (buffer As Ptr)
+Declare Sub PCFreeData Lib "libpcre2-8.so.0" Alias "pcre2_match_data_free_8" (data As Ptr)
+Declare Sub PCFree Lib "libpcre2-8.so.0" Alias "pcre2_code_free_8" (compiled As Ptr)
+
+#End If
+' Direct PCRE2 binding avoids the installed Linux runtime's missing bui_regex_* symbols.
+Function RegexGroup(value As String, pattern As String, number As Integer) As Optional Of String
+    Dim errorCode As Int32 = 0
+    Dim errorOffset As Integer = 0
+    Dim compiled As Ptr = PCCompile(pattern, -1, 655360, errorCode, errorOffset, Nil)
+    If compiled = Nil Then Throw New RuntimeException("Invalid regex: " + pattern)
+    Dim data As Ptr = PCData(compiled, Nil)
+    Try
+        If PCMatch(compiled, value, String.LenBytes(value), 0, 0, data, Nil) < 0 Then Return None
+        Dim buffer As Ptr = Nil
+        Dim length As Integer = 0
+        If PCSubstring(data, number, buffer, length) < 0 Then Return Some("")
+        Dim text As String = CType(CType(buffer, CString), String)
+        PCFreeString(buffer)
+        Return Some(text)
+    Finally
+        PCFreeData(data)
+        PCFree(compiled)
+    End Try
+End Function
+
+Function Match(value As String, pattern As String) As Boolean
+    Return RegexGroup(value, pattern, 0).HasValue
+End Function
+
+Function Group(value As String, pattern As String, number As Integer) As String
+    Return RegexGroup(value, pattern, number).Or("")
+End Function
+
+#Else
+Function Match(value As String, pattern As String) As Boolean
+    Return String.RegexMatch(value, pattern)
+End Function
+
+Function Group(value As String, pattern As String, number As Integer) As String
+    Return String.RegexReplace(value, "^[\\s\\S]*?(" + pattern + ")[\\s\\S]*$", "$" + Str(number + 1))
+End Function
+#End If
+
+Function Slice(value As String, start As Integer, finish As Integer = -1) As String
+    If finish < 0 Then finish = String.Len(value)
+    Return String.Mid(value, start + 1, finish - start)
+End Function
+
+Function Clean(value As String, mask As Boolean = True) As String
+    Dim out As String = ""
+    Dim pattern As String = "\"(?:\\\\.|[^\"\\\\])*\"|'.*|//.*"
+    While value <> ""
+        If Not Match(value, pattern) Then Return out + value
+        Dim token As String = Group(value, pattern, 0)
+        Dim offset As Integer = InStrExact(value, token) - 1
+        out += Slice(value, 0, offset)
+        If Slice(token, 0, 1) <> "\"" Then Return out
+        If mask Then
+            out += String.Space(String.Len(token))
+        Else
+            out += token
+        End If
+        value = Slice(value, offset + String.Len(token))
+    End While
+    Return out
+End Function
+
+Function Cell(value As String) As String
+    Return String.Replace(String.Replace(value, "|", "&#124;"), "\n", " ")
+End Function
+
+Function Code(value As String) As String
+    Return "`" + String.Replace(Cell(value), "`", "ˋ") + "`"
+End Function
+
+Function Typed(value As String) As JSONItem
+    Dim item As JSONItem = JSONItem.NewObject()
+    Dim masked As String = Clean(value)
+    Dim equal As Integer = InStrExact(masked, "=")
+    item.Value("default") = JSONItem.Null()
+    If equal > 0 Then
+        item.Value("default") = String.Trim(Slice(value, equal))
+        value = Slice(value, 0, equal - 1)
+    End If
+    value = String.Trim(value)
+    Dim pattern As String = "(?i)^(?:(ByRef|ByVal|ParamArray|Assigns)\s+)?([\w]+(?:\(\))?)\s+As\s+(.+)$"
+    If Not Match(value, pattern) Then Throw New RuntimeException("Unsupported typed declaration: " + value)
+    item.Value("name") = Group(value, pattern, 2)
+    item.Value("type") = Group(value, pattern, 3)
+    Dim mode As String = Group(value, pattern, 1)
+    If Exact(mode, "") Then mode = "ByVal"
+    item.Value("mode") = mode
+    Return item
+End Function
+
+Function Parameters(value As String) As JSONItem
+    Dim parsedParameters As JSONItem = JSONItem.NewArray()
+    Dim masked As String = Clean(value)
+    Dim start As Integer = 0
+    For i As Integer = 0 To String.Len(value) - 1
+        If Slice(masked, i, i + 1) = "," And Match(Slice(masked, i), "(?i)^,\s*(?:(?:ByRef|ByVal|ParamArray|Assigns)\s+)?\w+(?:\(\))?\s+As\b") Then
+            parsedParameters.Add(Typed(String.Trim(Slice(value, start, i))))
+            start = i + 1
+        End If
+    Next
+    If String.Trim(Slice(value, start)) <> "" Then parsedParameters.Add(Typed(String.Trim(Slice(value, start))))
+    Return parsedParameters
+End Function
+
+Function NewGroup(name As String, kind As String, signature As String, comment As String, source As String, line As Integer) As JSONItem
+    Dim item As JSONItem = JSONItem.NewObject()
+    item.Value("name") = name
+    item.Value("kind") = kind
+    item.Value("signature") = signature
+    item.Value("comment") = comment
+    item.Value("source") = source
+    item.Value("line") = line
+    item.Value("public") = True
+    item.Value("members") = JSONItem.NewArray()
+    Return item
+End Function
+
+Function HasWord(value As String, word As String) As Boolean
+    Return Match(value, "(^|\s)" + word + "($|\s)")
+End Function
+
+Function Declarations(library As String) As JSONItem
+    Dim groups As JSONItem = JSONItem.NewArray()
+    For Each filename As String In ModuleSources(library)
+        Dim file As New FileSystemItem(filename)
+        Dim lines As Array Of String = String.Split(String.Replace(H.ReadText(filename), "\r\n", "\n"), "\n")
+        Dim owner As JSONItem = Nil
+        Dim owners As Array Of JSONItem = []
+        Dim comments As Array Of String = []
+        Dim guards As Array Of String = []
+        Dim i As Integer = 0
+        While i < Array.Count(lines)
+            Dim raw As String = String.Trim(lines(i))
+            Dim lineNumber As Integer = i + 1
+            While EndsExact(String.Trim(Clean(raw)), "_")
+                i += 1
+                If i >= Array.Count(lines) Then Throw New RuntimeException(filename + ": unfinished continuation")
+                raw = Slice(String.Trim(raw), 0, String.Len(String.Trim(raw)) - 1) + " " + String.Trim(lines(i))
+            End While
+            If Not StartsExact(raw, "'''") Then raw = String.Trim(Clean(raw, False))
+            Dim masked As String = String.Trim(Clean(raw))
+            i += 1
+            If StartsExact(raw, "'''") Then
+                Array.Append(comments, String.Trim(Slice(raw, 3)))
+                Continue While
+            End If
+            If StartsExact(masked, "#If ") Then
+                Array.Append(guards, masked)
+            ElseIf (StartsExact(masked, "#ElseIf ") Or StartsExact(masked, "#Else")) And Array.Count(guards) > 0 Then
+                guards(Array.Count(guards) - 1) = masked
+            ElseIf StartsExact(masked, "#End If") And Array.Count(guards) > 0 Then
+                Array.RemoveAt(guards, Array.Count(guards) - 1)
+            End If
+            If Match(masked, "(?i)^End (Class|Structure|Interface|Enum|Flags Enum)\b") Then
+                owner = Nil
+                If Array.Count(owners) > 0 Then
+                    owner = owners(Array.Count(owners) - 1)
+                    Array.RemoveAt(owners, Array.Count(owners) - 1)
+                End If
+            End If
+            Dim typePattern As String = "(?i)^(?:(Public|Private|Internal)\s+)?(?:(?:Partial|Sequential|Packed|Flags)\s+)*(Class|Structure|Interface|Enum)\s+(\w+)"
+            If Match(masked, typePattern) Then
+                Dim visibility As String = Group(masked, typePattern, 1)
+                Dim kind As String = Group(masked, typePattern, 2)
+                Dim name As String = Group(masked, typePattern, 3)
+                Array.Append(owners, owner)
+                If owner <> Nil Then
+                    If owner.Value("public").AsBoolean().Or(False) Then name = S(owner, "name") + "." + name
+                End If
+                owner = NewGroup(name, kind, raw, String.Join(comments, " "), file.Name(), lineNumber)
+                owner.Value("public") = Not Exact(visibility, "Private") And Not Exact(visibility, "Internal")
+                If owner.Value("public").AsBoolean().Or(False) Then groups.Add(owner)
+            Else
+                Dim pattern As String = "(?i)^((?:(?:Public|Private|Protected|Internal|Shared|ReadOnly|Overrides|Extension|Delegate|Closure|Optional|Declare|Async)\s+)*)(Function|Sub|Property|Event|Const|Operator)\s+(\w+(?:\.\w+)*|<>|<=|>=|[=<>+*/\\\\-])"
+                Dim member As Boolean = Match(masked, pattern)
+                Dim mods As String = ""
+                Dim kind As String = ""
+                Dim name As String = ""
+                If member Then
+                    mods = Group(masked, pattern, 1)
+                    kind = Group(masked, pattern, 2)
+                    name = Group(masked, pattern, 3)
+                    If String.LCase(kind) <> "operator" And Not Match(name, "^\w+(?:\.\w+)*$") Then member = False
+                End If
+                Dim implicit As Boolean = False
+                Dim isPublic As Boolean = True
+                If owner <> Nil Then
+                    implicit = Exact(S(owner, "kind"), "Interface")
+                    isPublic = owner.Value("public").AsBoolean().Or(False)
+                End If
+                If member And (HasWord(mods, "Public") Or implicit) And isPublic Then
+                    Dim item As JSONItem = JSONItem.NewObject()
+                    item.Value("kind") = kind
+                    item.Value("name") = name
+                    item.Value("signature") = raw
+                    item.Value("comment") = String.Join(comments, " ")
+                    item.Value("guards") = String.Join(guards, " / ")
+                    item.Value("source") = file.Name()
+                    item.Value("line") = lineNumber
+                    item.Value("modifiers") = String.Trim(mods)
+                    Dim prefix As String = Group(masked, "(?i)^((?:(?:Public|Private|Protected|Internal|Shared|ReadOnly|Overrides|Extension|Delegate|Closure|Optional|Declare|Async)\s+)*(?:Function|Sub|Property|Event|Const|Operator)\s+)", 1)
+                    If Exact(kind, "Property") Or Exact(kind, "Const") Then
+                        Dim parsed As JSONItem = Typed(Slice(raw, String.Len(prefix)))
+                        item.Value("name") = parsed.Value("name")
+                        item.Value("type") = parsed.Value("type")
+                        item.Value("default") = parsed.Value("default")
+                        Dim propertyBody As String = ""
+                        Dim scan As Integer = i
+                        While scan < Array.Count(lines) And String.Trim(Clean(lines(scan))) = ""
+                            scan += 1
+                        End While
+                        If scan < Array.Count(lines) Then
+                            If Match(String.Trim(Clean(lines(scan))), "(?i)^(Get|Set)\b") Then
+                                Dim tail As String = ""
+                                While scan < Array.Count(lines)
+                                    tail += String.Trim(Clean(lines(scan))) + "\n"
+                                    If Match(String.Trim(Clean(lines(scan))), "(?i)End Property\b") Then Exit While
+                                    scan += 1
+                                End While
+                                If Match(tail, "(?i)^\s*(Get|Set)\b[\s\S]*?End Property\b") Then propertyBody = Group(tail, "(?i)^(\s*(?:Get|Set)\b[\s\S]*?End Property\b)", 1)
+                            End If
+                        End If
+                        item.Value("readonly") = HasWord(mods, "ReadOnly") Or (propertyBody <> "" And Not Match(propertyBody, "(?mi)^Set\b"))
+                    Else
+                        Dim start As Integer = InStrExact(masked, "(", String.Len(prefix) + String.Len(name) + 1) - 1
+                        If start < 0 Then Throw New RuntimeException(filename + ":" + Str(lineNumber) + ": missing parameter list")
+                        Dim depth As Integer = 0
+                        Dim finish As Integer = -1
+                        For j As Integer = start To String.Len(masked) - 1
+                            Dim ch As String = Slice(masked, j, j + 1)
+                            If Exact(ch, "(") Then depth += 1
+                            If Exact(ch, ")") Then
+                                depth -= 1
+                                If depth = 0 Then
+                                    finish = j
+                                    Exit For
+                                End If
+                            End If
+                        Next
+                        If finish < 0 Then Throw New RuntimeException(filename + ":" + Str(lineNumber) + ": unclosed parameter list")
+                        item.Value("parameters") = Parameters(Slice(raw, start + 1, finish))
+                        Dim datatype As String = String.Trim(Slice(raw, finish + 1))
+                        If StartsExact(datatype, "As ") Then
+                            datatype = Slice(datatype, 3)
+                        ElseIf Exact(kind, "Function") Then
+                            Throw New RuntimeException(filename + ":" + Str(lineNumber) + ": missing return type")
+                        End If
+                        item.Value("type") = datatype
+                    End If
+                    Dim target As JSONItem = owner
+                    If owner = Nil Then
+                        For n As Integer = 0 To groups.Count() - 1
+                            Dim candidate As JSONItem = groups.ValueAt(n)
+                            If Exact(S(candidate, "kind"), "Functions") And S(candidate, "source") = file.Name() Then target = candidate
+                        Next
+                        If target = Nil Then
+                            target = NewGroup(Slice(file.Name(), 0, String.Len(file.Name()) - 4) + " functions", "Functions", "", "", file.Name(), lineNumber)
+                            groups.Add(target)
+                        End If
+                    End If
+                    target.Value("members").Add(item)
+                ElseIf owner <> Nil Then
+                    If isPublic And Exact(S(owner, "kind"), "Structure") And Match(masked, "^\w+\s+As\s+.+$") Then
+                        Dim field As JSONItem = Typed(raw)
+                        field.Value("kind") = "Field"
+                        field.Value("signature") = raw
+                        field.Value("comment") = String.Join(comments, " ")
+                        owner.Value("members").Add(field)
+                    ElseIf isPublic And Exact(S(owner, "kind"), "Enum") And Match(masked, "^\w+(?:\s*=\s*(.+))?$") Then
+                        Dim enumItem As JSONItem = JSONItem.NewObject()
+                        enumItem.Value("name") = Group(masked, "^(\w+)", 1)
+                        enumItem.Value("kind") = "Enum value"
+                        enumItem.Value("type") = S(owner, "name")
+                        enumItem.Value("default") = JSONItem.Null()
+                        Dim equal As Integer = InStrExact(raw, "=")
+                        If equal > 0 Then enumItem.Value("default") = String.Trim(Slice(raw, equal))
+                        enumItem.Value("signature") = raw
+                        enumItem.Value("comment") = String.Join(comments, " ")
+                        owner.Value("members").Add(enumItem)
+                    ElseIf StartsExact(raw, "Public ") And Not member And Not StartsExact(masked, "Public Import ") Then
+                        Throw New RuntimeException(filename + ":" + Str(lineNumber) + ": unsupported public declaration: " + raw)
+                    End If
+                ElseIf StartsExact(raw, "Public ") And Not member And Not StartsExact(masked, "Public Import ") Then
+                    Throw New RuntimeException(filename + ":" + Str(lineNumber) + ": unsupported public declaration: " + raw)
+                End If
+            End If
+            If Not Exact(raw, "") Then comments = []
+        End While
+    Next
+    Dim merged As JSONItem = JSONItem.NewArray()
+    Dim partials As JSONItem = JSONItem.NewObject()
+    For i As Integer = 0 To groups.Count() - 1
+        Dim item As JSONItem = groups.ValueAt(i)
+        If Exact(S(item, "kind"), "Class") And Match(S(item, "signature"), "(?i)\bPartial\b") Then
+            Dim key As String = String.LCase(S(item, "name"))
+            If partials.HasKey(key) Then
+                Dim existing As JSONItem = partials.Value(key)
+                For j As Integer = 0 To item.Value("members").Count() - 1
+                    existing.Value("members").Add(item.Value("members").ValueAt(j))
+                Next
+                If InStrExact(S(item, "signature"), " Inherits ") > 0 Or (String.Len(S(item, "signature")) > String.Len(S(existing, "signature")) And InStrExact(S(existing, "signature"), " Inherits ") = 0) Then existing.Value("signature") = item.Value("signature")
+                If Not Exact(S(item, "comment"), "") And InStrExact(S(existing, "comment"), S(item, "comment")) = 0 Then existing.Value("comment") = String.Trim(S(existing, "comment") + " " + S(item, "comment"))
+                Continue For
+            End If
+            partials.Value(key) = item
+        End If
+        merged.Add(item)
+    Next
+    Return merged
+End Function
+
+Function Dump(value As JSONItem) As String
+    If value.IsString() Then
+        Dim text As String = value.AsString().Or("")
+        Dim out As String = "\""
+        For i As Integer = 0 To String.Len(text) - 1
+            Dim ch As String = Slice(text, i, i + 1)
+            Dim n As Integer = String.Asc(ch)
+            If n > 127 Then
+                If n > 65535 Then
+                    Dim cp As Integer = n - 65536
+                    out += "\u" + String.LCase(String.Right("0000" + Hex4(55296 + cp \ 1024), 4))
+                    n = 56320 + cp Mod 1024
+                End If
+                out += "\u" + String.LCase(String.Right("0000" + Hex4(n), 4))
+            Else
+                Dim escaped As String = Json.Stringify(JSONItem.From(ch))
+                out += Slice(escaped, 1, String.Len(escaped) - 1)
+            End If
+        Next
+        Return out + "\""
+    End If
+    If value.IsArray() Or value.IsObject() Then
+        Dim parts As Array Of String = []
+        For i As Integer = 0 To value.Count() - 1
+            If value.IsArray() Then
+                Array.Append(parts, Dump(value.ValueAt(i)))
+            Else
+                Dim key As String = value.KeyAt(i)
+                Array.Append(parts, Dump(JSONItem.From(key)) + ": " + Dump(value.Value(key)))
+            End If
+        Next
+        If value.IsArray() Then Return "[" + String.Join(parts, ", ") + "]"
+        Return "{" + String.Join(parts, ", ") + "}"
+    End If
+    Return Json.Stringify(value)
+End Function
+
+Function SortedNames(values As JSONItem, bounded As Boolean = False) As JSONItem
+    Dim names As Array Of String = values.Keys()
+    Array.Sort(names, AddressOf CompareExact)
+    Dim out As JSONItem = JSONItem.NewArray()
+    For Each name As String In names
+        If bounded And out.Count() >= 64 Then Exit For
+        out.Add(name)
+    Next
+    Return out
+End Function
+
+Sub Increment(stats As JSONItem, key As String, amount As Integer = 1)
+    stats.Value(key) = stats.Value(key).AsNumber().Or(0.0) + amount
+End Sub
+
+Function DefaultCode(item As JSONItem, absent As String) As String
+    If item.Value("default").IsNull() Then Return absent
+    Return Code(S(item, "default"))
+End Function
+
+Function Description(item As JSONItem) As String
+    If Exact(S(item, "comment"), "") Then Return "—"
+    Return Cell(S(item, "comment"))
+End Function
+
+Function RenderGroup(library As String, groups As JSONItem, title As String = "", prefix As String = "") As JSONItem
+    Dim meta As JSONItem = Json.Parse(H.ReadText(Path.Join(library, "manifest.json")))
+    Dim name As String = S(meta, "name")
+    Dim types As JSONItem = JSONItem.NewObject()
+    Dim symbols As JSONItem = JSONItem.NewObject()
+    For i As Integer = 0 To groups.Count() - 1
+        Dim g As JSONItem = groups.ValueAt(i)
+        If Not Exact(S(g, "kind"), "Functions") Then types.Value(S(g, "name")) = True
+        For j As Integer = 0 To g.Value("members").Count() - 1
+            Dim m As JSONItem = g.Value("members").ValueAt(j)
+            If HasWord(S(m, "modifiers"), "Closure") Or HasWord(S(m, "modifiers"), "Delegate") Then types.Value(S(m, "name")) = True
+            symbols.Value(S(m, "name")) = True
+        Next
+    Next
+    Dim dependencies As JSONItem = JSONItem.NewObject()
+    Dim settingsFile As New FileSystemItem(Path.Join(library, "bpm.json"))
+    If settingsFile.IsFile() Then
+        Dim settings As JSONItem = Json.Parse(H.ReadText(settingsFile.FullPath()))
+        For Each dependency As String In settings.Value("dependencies").Keys()
+            If Match(dependency, "^[a-z][a-z0-9_]{0,63}$") Then dependencies.Value(dependency) = True
+        Next
+    End If
+    Dim front As JSONItem = JSONItem.NewObject()
+    If Exact(title, "") Then title = name + " typed API"
+    front.Value("title") = title
+    front.Value("summary") = "Source-derived public signatures, properties, parameters, defaults, and return values."
+    front.Value("category") = "Reference"
+    front.Value("order") = 21
+    front.Value("types") = SortedNames(types, True)
+    front.Value("dependencies") = SortedNames(dependencies)
+    If types.Count() > 0 Then symbols = types
+    front.Value("symbols") = SortedNames(symbols, True)
+    front.Value("related") = JSONItem.NewArray()
+    For Each page As String In ["api.md", "getting-started.md", "index.md"]
+        front.Value("related").Add(prefix + page)
+    Next
+    Dim out As String = "---\n"
+    For Each key As String In front.Keys()
+        out += key + ": " + Dump(front.Value(key)) + "\n"
+    Next
+    out += "---\n\n# " + S(front, "title") + "\n\nGenerated from the package source declarations. Platform guards are shown where present; inherited members are documented on the base type. See the [API contracts](" + prefix + "api.md) for behavior and limitations.\n"
+    Dim stats As JSONItem = JSONItem.NewObject()
+    stats.Value("types") = types.Count()
+    For i As Integer = 0 To groups.Count() - 1
+        Dim g As JSONItem = groups.ValueAt(i)
+        out += "\n## " + S(g, "name") + "\n"
+        If Not Exact(S(g, "signature"), "") Then out += "\n" + Code(S(g, "signature")) + "\n"
+        If Not Exact(S(g, "comment"), "") Then out += "\n" + Cell(S(g, "comment")) + "\n"
+        Dim members As JSONItem = g.Value("members")
+        For Each kind As String In ["Property", "Field", "Const", "Enum value"]
+            Dim started As Boolean = False
+            For j As Integer = 0 To members.Count() - 1
+                Dim m As JSONItem = members.ValueAt(j)
+                If Not Exact(S(m, "kind"), kind) Then Continue For
+                If Not started Then
+                    If Exact(kind, "Property") Then
+                        out += "\n### Properties\n\n| Name | Type | Read-Only | Shared | Default | Description |\n| --- | --- | --- | --- | --- | --- |\n"
+                    Else
+                        Dim title As String = "Values"
+                        If Exact(kind, "Field") Then title = "Fields"
+                        If Exact(kind, "Const") Then title = "Constants"
+                        out += "\n### " + title + "\n\n| Name | Type | Value / Default | Description |\n| --- | --- | --- | --- |\n"
+                    End If
+                    started = True
+                End If
+                out += "| " + Code(S(m, "name")) + " | " + Code(S(m, "type")) + " | "
+                If Exact(kind, "Property") Then
+                    Dim readOnlyText As String = "No"
+                    Dim sharedValue As String = "No"
+                    If m.Value("readonly").AsBoolean().Or(False) Then readOnlyText = "Yes"
+                    If HasWord(S(m, "modifiers"), "Shared") Then sharedValue = "Yes"
+                    out += readOnlyText + " | " + sharedValue + " | "
+                End If
+                out += DefaultCode(m, "—") + " | " + Description(m) + " |\n"
+            Next
+        Next
+        Dim overloads As JSONItem = JSONItem.NewObject()
+        For j As Integer = 0 To members.Count() - 1
+            Dim m As JSONItem = members.ValueAt(j)
+            Dim kind As String = S(m, "kind")
+            Increment(stats, kind)
+            If Not Exact(kind, "Function") And Not Exact(kind, "Sub") And Not Exact(kind, "Event") And Not Exact(kind, "Operator") Then Continue For
+            Dim memberName As String = S(m, "name")
+            Increment(overloads, memberName)
+            Dim count As Integer = Integer.Parse(Json.Stringify(overloads.Value(memberName))).Or(0)
+            Dim suffix As String = ""
+            If count > 1 Then suffix = " (overload " + Str(count) + ")"
+            out += "\n### " + memberName + suffix + "\n\n" + Code(S(m, "signature")) + "\n"
+            If Not Exact(S(m, "comment"), "") Then out += "\n" + Cell(S(m, "comment")) + "\n"
+            If Not Exact(S(m, "guards"), "") Then out += "\nAvailability: " + Code(S(m, "guards")) + "\n"
+            Dim params As JSONItem = m.Value("parameters")
+            If params.Count() > 0 Then
+                out += "\n#### Parameters\n\n| Name | Type | Passing | Default |\n| --- | --- | --- | --- |\n"
+                For p As Integer = 0 To params.Count() - 1
+                    Dim param As JSONItem = params.ValueAt(p)
+                    out += "| " + Code(S(param, "name")) + " | " + Code(S(param, "type")) + " | " + Code(S(param, "mode")) + " | " + DefaultCode(param, "Required") + " |\n"
+                Next
+                Increment(stats, "parameters", params.Count())
+            Else
+                out += "\nNo parameters.\n"
+            End If
+            If Not Exact(S(m, "type"), "") Then
+                out += "\n#### Returns\n\n| Type |\n| --- |\n| " + Code(S(m, "type")) + " |\n"
+            Else
+                out += "\nReturns: no value.\n"
+            End If
+        Next
+    Next
+    Dim rendered As JSONItem = JSONItem.NewObject()
+    rendered.Value("content") = out
+    rendered.Value("stats") = stats
+    Return rendered
+End Function
+
+Function Hex4(n As Integer) As String
+    Dim out As String = ""
+    For i As Integer = 1 To 4
+        out = String.Mid("0123456789abcdef", (n Mod 16) + 1, 1) + out
+        n = n \ 16
+    Next
+    Return out
+End Function
+
+Function FrontMatter(fields As JSONItem) As String
+    Dim text As String = "---\n"
+    For Each key As String In fields.Keys()
+        text += key + ": " + Dump(fields.Value(key)) + "\n"
+    Next
+    Return text + "---\n\n"
+End Function
+
+Sub BootstrapPages(library As String)
+    Dim directory As String = Path.Join(library, "resources/buoy-docs")
+    H.MakeDirectory(directory)
+    Dim meta As JSONItem = Json.Parse(H.ReadText(Path.Join(library, "manifest.json")))
+    Dim name As String = S(meta, "name")
+    Dim groups As JSONItem = Declarations(library)
+    Dim symbols As JSONItem = JSONItem.NewArray()
+    For i As Integer = 0 To groups.Count() - 1
+        If S(groups.ValueAt(i), "kind") <> "Functions" And symbols.Count() < 64 Then symbols.Add(S(groups.ValueAt(i), "name"))
+    Next
+    Dim modules As Array Of String = []
+    For Each filename As String In ModuleSources(library)
+        Dim file As New FileSystemItem(filename)
+        Array.Append(modules, Code(Slice(file.Name(), 0, String.Len(file.Name()) - 4)))
+    Next
+    Dim readme As New FileSystemItem(Path.Join(library, "README.md"))
+    Dim contract As String = meta.Value("description").AsString().Or(name)
+    If readme.IsFile() Then contract = H.ReadText(readme.FullPath())
+    Dim linkPattern As String = "!?\[([^\]]*)\]\([^)]*\)"
+    While Match(contract, linkPattern)
+        Dim whole As String = Group(contract, linkPattern, 0)
+        Dim label As String = Group(contract, linkPattern, 1)
+        contract = String.Replace(contract, whole, label, 1, True)
+    End While
+    For Each filename As String In ["index.md", "getting-started.md", "api.md"]
+        Dim target As New FileSystemItem(Path.Join(directory, filename))
+        If target.IsFile() Then Continue For
+        Dim title As String = "Overview"
+        Dim summary As String = meta.Value("description").AsString().Or(name + " package documentation.")
+        Dim body As String = "# " + name + "\n\n" + meta.Value("description").AsString().Or(name + " library") + "\n\n[Getting started](getting-started.md) · [API contracts](api.md) · [Typed API](typed-api.md)"
+        Dim category As String = "Guide"
+        If Exact(filename, "getting-started.md") Then
+            title = "Getting started"
+            summary = "Install, import, and explore the public " + name + " API."
+            body = "# Getting started\n\nInstall the " + name + " package into your project’s packages directory. Import the module you need: " + String.Join(modules, ", ") + ".\n\nStart with the [API contracts](api.md) for usage, constraints, and platform limitations. The [typed API](typed-api.md) lists constructors, each parameter and its default, properties, and return values directly from source.\n\n[Package overview](index.md)"
+        ElseIf Exact(filename, "api.md") Then
+            title = "API contracts"
+            summary = "Usage and behavioral contracts for " + name + "."
+            body = contract + "\n\n[Typed API](typed-api.md) · [Getting started](getting-started.md)"
+            category = "Reference"
+        End If
+        Dim fields As JSONItem = JSONItem.NewObject()
+        fields.Value("title") = name + " " + title
+        fields.Value("summary") = summary
+        fields.Value("category") = category
+        fields.Value("symbols") = symbols
+        H.WriteText(target.FullPath(), FrontMatter(fields) + body + "\n")
+    Next
+End Sub
+
+Function Pretty(value As JSONItem) As String
+    Dim options As New JSONOptions
+    options.Compact = False
+    options.IndentSpacing = 2
+    Return Json.Stringify(value, options)
+End Function
+
+Sub SyncArchive(library As String, root As String)
+    Dim meta As JSONItem = Json.Parse(H.ReadText(Path.Join(library, "manifest.json")))
+    ' Native QA owns this archive until its dedicated builder releases the hold.
+    If Exact(S(meta, "name"), "updatekit") Or Exact(S(meta, "name"), "processkit") Then
+        StdErr.WriteLine("Skipping updatekit archive: owned by tools/build_updatekit.py (native QA hold).")
+        Exit Sub
+    End If
+    Dim archive As String = Path.Join(root, "packages/" + S(meta, "name") + "-" + S(meta, "version") + ".buipkg")
+    ' Seal with the compiler so resources, hashes, and package digest stay consistent.
+    ' Resealing is intentional: no external ZIP reader is required by this port.
+    Dim compiler As String = "buoy"
+    Dim installed As New FileSystemItem("/usr/share/buoy/buoy")
+    If installed.IsFile() Then compiler = installed.FullPath()
+    H.Capture(H.Q(compiler) + " pkg seal " + H.Q(library) + " -o " + H.Q(archive), root, 120000)
+End Sub
+
+Function Generate(root As String, checking As Boolean, archives As Boolean, selected As JSONItem) As JSONItem
+    Dim report As JSONItem = JSONItem.NewObject()
+    Dim libraries As New FileSystemItem(Path.Join(root, "libraries"))
+    Dim paths As Array Of String = []
+    For Each folder As FileSystemItem In libraries.Children()
+        If folder.IsFolder() And folder.Child("manifest.json").IsFile() Then Array.Append(paths, folder.FullPath())
+    Next
+    Array.Sort(paths, AddressOf CompareExact)
+    For Each library As String In paths
+        Dim folder As New FileSystemItem(library)
+        If selected.Count() > 0 And Not selected.HasKey(folder.Name()) Then Continue For
+        Dim directory As String = Path.Join(library, "resources/buoy-docs")
+        If Not checking Then
+            Dim legacy As New FileSystemItem(Path.Join(directory, "reference.md"))
+            If legacy.IsFile() Then
+                If InStrExact(H.ReadText(legacy.FullPath()), "summary: \"Source-derived public signatures, properties, parameters, defaults, and return values.\"") > 0 Then
+                    If Not legacy.Delete() Then Throw New RuntimeException("Cannot delete " + legacy.FullPath())
+                    For Each page As String In H.Sources(directory, "", ".md")
+                        Dim content As String = H.ReadText(page)
+                        content = String.Replace(content, "(reference.md)", "(typed-api.md)", String.Len(content) + 1, True)
+                        content = String.Replace(content, "\"reference.md\"", "\"typed-api.md\"", String.Len(content) + 1, True)
+                        H.WriteText(page, content)
+                    Next
+                End If
+            End If
+            Dim settingsFile As New FileSystemItem(Path.Join(library, "bpm.json"))
+            If settingsFile.IsFile() Then
+                Dim settings As JSONItem = Json.Parse(H.ReadText(settingsFile.FullPath()))
+                If settings.HasKey("files") Then
+                    Dim included As Boolean = False
+                    Dim files As JSONItem = settings.Value("files")
+                    For i As Integer = 0 To files.Count() - 1
+                        Dim name As String = files.ValueAt(i).AsString().Or("")
+                        If Exact(name, "resources") Or Exact(name, "resources/buoy-docs") Then included = True
+                    Next
+                    If Not included Then
+                        files.Add("resources/buoy-docs")
+                        H.WriteText(settingsFile.FullPath(), Pretty(settings) + "\n")
+                    End If
+                End If
+            End If
+            BootstrapPages(library)
+        End If
+        Dim rendered As JSONItem = RenderPages(library)
+        Dim target As New FileSystemItem(Path.Join(directory, "typed-api.md"))
+        Dim pages As JSONItem = rendered.Value("pages")
+        For Each filename As String In pages.Keys()
+            Dim page As New FileSystemItem(Path.Join(directory, filename))
+            If checking Then
+                If Not page.IsFile() Then Throw New RuntimeException("Stale typed API: " + page.FullPath())
+                If String.Compare(H.ReadText(page.FullPath()), S(pages, filename), True) <> 0 Then Throw New RuntimeException("Stale typed API: " + page.FullPath())
+            Else
+                H.MakeDirectory(page.ParentPath())
+                H.WriteText(page.FullPath(), S(pages, filename))
+            End If
+        Next
+        If Not checking Then
+            For Each filename As String In H.Sources(directory, "", ".md")
+                Dim page As New FileSystemItem(filename)
+                If page.Name() = "typed-api.md" Then Continue For
+                Dim content As String = H.ReadText(filename)
+                Dim summary As String = Dump(JSONItem.From("Usage and API contracts for " + folder.Name() + "."))
+                If Not StartsExact(content, "---\n", True) Then
+                    content = "---\nsummary: " + summary + "\n---\n\n" + content
+                Else
+                    Dim finish As Integer = InStrExact(content, "\n---", 4) - 1
+                    If finish < 0 Then Throw New RuntimeException("Unclosed front matter: " + filename)
+                    If InStrExact(Slice(content, 0, finish), "\nsummary:") = 0 Then content = Slice(content, 0, finish) + "\nsummary: " + summary + Slice(content, finish)
+                End If
+                If InStrExact(content, "\nrelated:") = 0 Then
+                    Dim related As JSONItem = JSONItem.NewArray()
+                    For Each name As String In ["index.md", "getting-started.md", "api.md", "typed-api.md"]
+                        If name <> page.Name() Then related.Add(name)
+                    Next
+                    Dim finish As Integer = InStrExact(content, "\n---", 4) - 1
+                    content = Slice(content, 0, finish) + "\nrelated: " + Dump(related) + Slice(content, finish)
+                End If
+                If page.Name() = "api.md" And InStrExact(content, "(typed-api.md)") = 0 Then content += "\n\n[Full typed API: properties, parameters, defaults, and returns](typed-api.md)\n"
+                H.WriteText(filename, content)
+            Next
+            If archives Then SyncArchive(library, root)
+        End If
+        report.Value(folder.Name()) = rendered.Value("stats")
+    Next
+    Return report
+End Function
+
+Function Main(args As Array Of String) As Integer
+    Try
+        Dim checking As Boolean = False
+        Dim archives As Boolean = False
+        Dim selected As JSONItem = JSONItem.NewObject()
+        Dim root As String = H.WorkspaceRoot()
+        Dim i As Integer = 1
+        While i < Array.Count(args)
+            Select Case args(i)
+                Case "--help", "-h"
+                    Print "Usage: ahoy tools/generate_api_documentation.bui [--check] [--sync-archives] [--library NAME] [--root PATH]"
+                    Print "       --render LIBRARY | --stats LIBRARY | --pages LIBRARY (read-only inspection)"
+                    Return 0
+                Case "--check"
+                    checking = True
+                Case "--sync-archives"
+                    archives = True
+                Case "--root", "--render", "--stats", "--library", "--pages"
+                    Dim option As String = args(i)
+                    i += 1
+                    If i >= Array.Count(args) Then Throw New RuntimeException("Missing value for " + option)
+                    If Exact(option, "--library") Then
+                        selected.Value(args(i)) = True
+                    ElseIf Exact(option, "--root") Then
+                        root = args(i)
+                    ElseIf Exact(option, "--pages") Then
+                        Print Json.Stringify(RenderPages(args(i)).Value("pages"))
+                        Return 0
+                    ElseIf Exact(option, "--render") Then
+                        StdOut.Write(S(Render(args(i)), "content"))
+                        Return 0
+                    Else
+                        Print Pretty(Render(args(i)).Value("stats"))
+                        Return 0
+                    End If
+                Case Else
+                    Throw New RuntimeException("Unknown argument: " + args(i))
+            End Select
+            i += 1
+        End While
+        Print Pretty(Generate(root, checking, archives, selected))
+        Return 0
+    Catch e As Exception
+        StdErr.WriteLine(e.Message)
+        Return 1
+    End Try
+End Function
+
+Function RenderPages(library As String) As JSONItem
+    Dim groups As JSONItem = Declarations(library)
+    Dim complete As JSONItem = RenderGroup(library, groups)
+    Dim pages As JSONItem = JSONItem.NewObject()
+    If complete.Value("stats").Value("types").AsNumber().Or(0.0) <= 64 Then
+        pages.Value("typed-api.md") = complete.Value("content")
+    Else
+        Dim name As String = S(Json.Parse(H.ReadText(Path.Join(library, "manifest.json"))), "name")
+        Dim overview As String = S(RenderGroup(library, JSONItem.NewArray()), "content")
+        Dim used As JSONItem = JSONItem.NewObject()
+        Dim stats As JSONItem = JSONItem.NewObject()
+        For i As Integer = 0 To groups.Count() - 1
+            Dim g As JSONItem = groups.ValueAt(i)
+            Dim stem As String = ""
+            Dim raw As String = String.LCase(S(g, "name"))
+            For j As Integer = 0 To String.Len(raw) - 1
+                Dim ch As String = Slice(raw, j, j + 1)
+                If Match(ch, "[\w\s-]") Then stem += ch
+            Next
+            Dim words As Array Of String = []
+            Dim word As String = ""
+            stem = String.Trim(stem)
+            For j As Integer = 0 To String.Len(stem) - 1
+                Dim ch As String = Slice(stem, j, j + 1)
+                If Match(ch, "\s") Then
+                    If Not Exact(word, "") Then Array.Append(words, word)
+                    word = ""
+                Else
+                    word += ch
+                End If
+            Next
+            If Not Exact(word, "") Then Array.Append(words, word)
+            stem = String.Join(words, "-")
+            Increment(used, stem)
+            Dim suffix As String = ""
+            If used.Value(stem).AsNumber().Or(0.0) > 1 Then suffix = "-" + Json.Stringify(used.Value(stem))
+            Dim filename As String = "typed-api/" + stem + suffix + ".md"
+            Dim one As JSONItem = JSONItem.NewArray()
+            one.Add(g)
+            Dim rendered As JSONItem = RenderGroup(library, one, name + " · " + S(g, "name"), "../")
+            If rendered.Value("stats").Value("types").AsNumber().Or(0.0) > 64 Then Throw New RuntimeException("A single reference group exceeds the type metadata limit: " + name)
+            pages.Value(filename) = rendered.Value("content")
+            Dim counts As JSONItem = rendered.Value("stats")
+            For Each key As String In counts.Keys()
+                stats.Value(key) = stats.Value(key).AsNumber().Or(0.0) + counts.Value(key).AsNumber().Or(0.0)
+            Next
+            overview += "\n## " + S(g, "name") + "\n\n[Full reference for " + S(g, "name") + "](" + filename + ")\n"
+        Next
+        pages.Value("typed-api.md") = overview
+        complete.Value("stats") = stats
+    End If
+    complete.Value("pages") = pages
+    complete.Value("content") = pages.Value("typed-api.md")
+    Return complete
+End Function
+
+Function Render(library As String) As JSONItem
+    Return RenderPages(library)
+End Function
+
+Function CompareExact(a As String, b As String) As Integer
+    Return String.Compare(a, b, True)
+End Function
+
+Function ModuleSources(library As String) As Array Of String
+    Dim sources As Array Of String = H.Sources(Path.Join(library, "modules"))
+    Array.Sort(sources, AddressOf CompareExact)
+    Return sources
+End Function
+
+Function Exact(a As String, b As String) As Boolean
+    Return String.Compare(a, b, True) = 0
+End Function
+
+Function StartsExact(value As String, prefix As String, caseSensitive As Boolean = True) As Boolean
+    Return String.StartsWith(value, prefix, True)
+End Function
+
+Function EndsExact(value As String, suffix As String) As Boolean
+    Return String.EndsWith(value, suffix, True)
+End Function
+
+Function InStrExact(value As String, search As String, start As Integer = 1) As Integer
+    Return String.InStr(value, search, start, True)
+End Function

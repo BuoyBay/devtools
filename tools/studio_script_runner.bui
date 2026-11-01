@@ -1,0 +1,91 @@
+' Optional console helper. Build with the same Buoy SDK/runtime as libbuoyscript.
+' Native JIT code has the helper's OS privileges. This is crash containment, not a sandbox.
+Import buoyscript
+
+Delegate Sub StudioScriptEntry()
+Delegate Sub StudioScriptResult(value As String)
+Delegate Function StudioScriptTool(name As String, argumentsJson As String) As String
+
+Private Class ScriptChannel
+    Public Shared Property ModeKnown As Boolean = False
+    Public Shared Property ConsoleMode As Boolean = False
+End Class
+
+Private Sub ScriptReply(message As String)
+    If Not ScriptChannel.ModeKnown Then
+        StdErr.WriteLine(message)
+        StdErr.Flush()
+    End If
+    If ScriptChannel.ConsoleMode Then
+        StdErr.WriteLine(message)
+        StdErr.Flush()
+    Else
+        StdOut.WriteLine(message)
+        StdOut.Flush()
+    End If
+End Sub
+
+Private Function ScriptTool(name As String, argumentsJson As String) As String
+    Try
+        Dim request As JSONItem = JSONItem.NewObject()
+        request.Value("kind") = "call"
+        request.Value("name") = name
+        request.Value("arguments") = Json.Parse(argumentsJson)
+        ScriptReply(request.ToString())
+        Dim response As Optional Of String = StdIn.ReadLine()
+        If Not response.HasValue Then Return "{\"error\":{\"message\":\"Studio disconnected; stop this script\"}}"
+        Return response.Value
+    Catch e As Exception
+        Dim failure As JSONItem = JSONItem.NewObject()
+        Dim detail As JSONItem = JSONItem.NewObject()
+        detail.Value("message") = "ProjectTool arguments must be valid JSON and Studio must remain connected: " + String.Left(e.Message, 2048)
+        failure.Value("error") = detail
+        Return failure.ToString()
+    End Try
+End Function
+
+Private Sub ScriptResult(value As String)
+    Dim reply As JSONItem = JSONItem.NewObject()
+    reply.Value("kind") = "done"
+    reply.Value("ok") = True
+    reply.Value("value") = value
+    ScriptReply(reply.ToString())
+End Sub
+
+Private Sub ScriptFailure(value As String)
+    Dim reply As JSONItem = JSONItem.NewObject()
+    reply.Value("kind") = "done"
+    reply.Value("ok") = False
+    reply.Value("error") = "Script runtime error: " + String.Left(value, 4096) + ". Read project_script_help; earlier edits remain undoable."
+    ScriptReply(reply.ToString())
+End Sub
+
+Sub Main()
+    Dim reply As JSONItem = JSONItem.NewObject()
+    reply.Value("kind") = "done"
+    Try
+        Dim line As Optional Of String = StdIn.ReadLine()
+        If Not line.HasValue Then Throw New InvalidArgumentException("Expected a JSON source request on stdin")
+        Dim request As JSONItem = Json.Parse(line.Value)
+        ScriptChannel.ConsoleMode = request.Value("console").AsBoolean().Or(False)
+        ScriptChannel.ModeKnown = True
+        Dim body As String = request.Value("source").AsString().Or("")
+        If body = "" Or String.LenBytes(body) > 65536 Then Throw New InvalidArgumentException("source must contain 1..65536 UTF-8 bytes; call project_script_help")
+        Dim script As New BuoyScript()
+        Dim callback As StudioScriptTool = AddressOf ScriptTool
+        script.RegisterHostFunction("ProjectTool", CType(callback, Ptr))
+        Dim resultCallback As StudioScriptResult = AddressOf ScriptResult
+        Dim failureCallback As StudioScriptResult = AddressOf ScriptFailure
+        script.RegisterHostFunction("StudioResult", CType(resultCallback, Ptr))
+        script.RegisterHostFunction("StudioFailure", CType(failureCallback, Ptr))
+        ' The host owns the entry signature; callers supply only its body.
+        script.Eval("Declare Function ProjectTool Lib \"host\" (name As String, argumentsJson As String) As String\nDeclare Sub StudioResult Lib \"host\" (value As String)\nDeclare Sub StudioFailure Lib \"host\" (value As String)\nFunction StudioBody() As String\n" + body + "\nEnd Function\nExport Sub StudioRun()\nTry\nStudioResult(StudioBody())\nCatch e As Exception\nStudioFailure(e.Message)\nEnd Try\nEnd Sub", "studio-agent-script")
+        Dim run As StudioScriptEntry = CType(script.Invoke("StudioRun"), StudioScriptEntry)
+        run()
+        Return
+    Catch e As Exception
+        reply.Value("ok") = False
+        reply.Value("error") = "BuoyScript compile/lookup failed: " + String.Left(e.Message, 4096) + ". Read project_script_help; source is a function body returning String (no Import or entry declaration)."
+    End Try
+    ScriptReply(reply.ToString())
+End Sub

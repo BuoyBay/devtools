@@ -1,0 +1,69 @@
+' Renders the Buoy glyph contact sheet through Buoy's own SVG rasterizer, so the
+' review image shows exactly what Picture.FromSVG produces inside Studio.
+'
+' Usage: render_iconset <svg-dir> <key-list> <out.png>
+' The key list is one glyph key per line; tools/build_iconset.py writes it.
+
+Const Columns As Integer = 4
+Const CellWidth As Integer = 360
+Const CellHeight As Integer = 64
+
+Private Function Tinted(source As String, hex As String) As Bytes
+    Return Bytes.FromString(String.Replace(source, "currentColor", hex), Text.Encodings.UTF8)
+End Function
+
+''' Draws one glyph at every review size: 16/20/24 at 1x plus a 48px enlargement.
+Private Sub DrawSizes(g As Graphics, source As String, hex As String, x As Double, y As Double)
+    Dim offset As Double = x
+    For Each size As Integer In [16, 20, 24, 48]
+        Dim glyph As Picture = Picture.FromSVG(Tinted(source, hex), size, size)
+        If glyph <> Nil Then g.DrawPicture(glyph, offset, y + (48 - size) / 2.0)
+        offset += size + 10.0
+    Next
+End Sub
+
+Sub Main(args As Array Of String)
+    If Array.Count(args) < 4 Then
+        Print "usage: render_iconset <svg-dir> <key-list> <out.png>"
+        Return
+    End If
+    Dim listed As Result Of String, String = New FileSystemItem(args(2)).ReadAllText()
+    If listed.IsErr Then
+        Print "cannot read key list: " + listed.Error
+        Return
+    End If
+    Dim keys As Array Of String = []
+    For Each line As String In String.Split(listed.Value, "\n")
+        If String.Trim(line) <> "" Then Array.Append(keys, String.Trim(line))
+    Next
+    Dim rows As Integer = (Array.Count(keys) + Columns - 1) \ Columns
+    Dim sheet As New Picture(Columns * CellWidth, rows * CellHeight * 2 + 16)
+    Dim g As Graphics = sheet.Graphics
+    Dim half As Double = (rows * CellHeight) + 8.0
+    g.FillRect(0.0, 0.0, Columns * CellWidth, half, Color.RGB(0.98, 0.98, 0.97))
+    g.FillRect(0.0, half, Columns * CellWidth, half + 8.0, Color.RGB(0.13, 0.14, 0.16))
+    Dim failures As Integer = 0
+    For i As Integer = 0 To Array.Count(keys) - 1
+        Dim read As Result Of String, String = New FileSystemItem(args(1) + "/" + keys(i) + ".svg").ReadAllText()
+        If read.IsErr Then
+            failures += 1
+            Continue For
+        End If
+        If Picture.FromSVG(Tinted(read.Value, "#1d1d1f"), 24, 24) = Nil Then
+            Print "rasterize failed: " + keys(i)
+            failures += 1
+        End If
+        Dim x As Double = ((i Mod Columns) * CellWidth) + 12.0
+        Dim y As Double = ((i \ Columns) * CellHeight) + 8.0
+        DrawSizes(g, read.Value, "#1d1d1f", x, y)
+        g.DrawString(keys(i), x + 140.0, y + 30.0, "sans-serif", 11.0, Color.RGB(0.3, 0.3, 0.32))
+        DrawSizes(g, read.Value, "#e8e8ea", x, y + half)
+        g.DrawString(keys(i), x + 140.0, y + half + 30.0, "sans-serif", 11.0, Color.RGB(0.75, 0.75, 0.78))
+    Next
+    Dim saved As Result Of Boolean, IOError = sheet.Save(New FileSystemItem(args(3)), Picture.ImageFormat.PNG)
+    If saved.IsErr Then
+        Print "save failed: " + saved.Error.Message
+        Return
+    End If
+    Print "rendered " + String.From(Array.Count(keys)) + " glyphs, failures " + String.From(failures)
+End Sub

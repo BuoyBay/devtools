@@ -1,0 +1,158 @@
+Import "buoydev/Common"
+Import crypto.Crypto
+Import zip.Zip
+
+Public Function StudioNativeBytes(filename As String) As Bytes
+    Dim opened As Result Of BinaryStream, IOError = BinaryStream.Open(New FileSystemItem(filename), False)
+    If opened.IsErr Then Throw New IOException("Cannot read " + filename)
+    Dim stream As BinaryStream = opened.Value
+    Try
+        DevNeed(stream.Length <= 536870912, "Studio build input exceeds 512 MiB: " + filename)
+        Return stream.Read(stream.Length)
+    Finally
+        stream.Close()
+    End Try
+End Function
+
+Public Function StudioNativeHash(filename As String) As String
+    Return Crypto.Hash(Crypto.HashAlgorithms.SHA256, StudioNativeBytes(filename)).ToHex()
+End Function
+
+Public Sub StudioNativeCopy(source As String, destination As String)
+    DevNeed(Not DevIsLink(source), "Symlink build input rejected: " + source)
+    Dim input As New FileSystemItem(source)
+    DevNeed(input.IsFile(), "Missing build input: " + source)
+    Dim output As New FileSystemItem(destination)
+    DevMkdir(output.ParentPath())
+    DevNeed(input.CopyTo(output), "Cannot copy " + source)
+    #If Not TargetWindows Then
+        output.Permissions.Mode = input.Permissions.Mode And &o777
+    #End If
+End Sub
+
+Public Function StudioNativeFiles(root As String) As Array Of String
+    Dim files As Array Of String = []
+    Dim folder As New FileSystemItem(root)
+    For Each item As FileSystemItem In folder.Children()
+        DevNeed(Not DevIsLink(item.FullPath()), "Symlink build input rejected: " + item.FullPath())
+        If item.IsFolder() Then
+            For Each child As String In StudioNativeFiles(item.FullPath())
+                Array.Append(files, item.Name() + "/" + child)
+            Next
+        ElseIf item.IsFile() Then
+            Array.Append(files, item.Name())
+        End If
+    Next
+    Array.Sort(files)
+    Return files
+End Function
+
+Public Sub StudioNativeTree(source As String, destination As String)
+    DevNeed(New FileSystemItem(source).IsFolder(), "Missing input directory: " + source)
+    For Each relative As String In StudioNativeFiles(source)
+        StudioNativeCopy(Path.Join(source, relative), Path.Join(destination, relative))
+    Next
+End Sub
+
+Public Function StudioNativeRun(argv As Array Of String, cwd As String, timeout As Double = 120.0) As String
+    Dim outcome As JSONItem = DevExecute(argv, cwd, timeout, 16777216)
+    Dim output As String = outcome.Value("stdout").AsString().Or("")
+    Dim errors As String = outcome.Value("stderr").AsString().Or("")
+    DevNeed(Not outcome.Value("truncated").AsBoolean().Or(False), "Build command output exceeded 16 MiB: " + argv(0))
+    DevNeed(Not outcome.Value("timeout").AsBoolean().Or(False), "Build command timed out: " + argv(0))
+    DevNeed(outcome.Value("returncode").AsNumber().Or(-1.0) = 0.0, "Build command failed: " + argv(0) + "\n" + output + errors)
+    If errors <> "" Then StdErr.Write(errors)
+    Return output
+End Function
+
+Public Function StudioNativeTarget() As String
+    Dim cpu As String = "x86_64"
+    #If TargetArm Then
+        cpu = "arm64"
+    #End If
+    #If TargetLinux Then
+        Return cpu + "-linux"
+    #ElseIf TargetMac Then
+        Return cpu + "-darwin"
+    #Else
+        Return cpu + "-windows"
+    #End If
+End Function
+
+' Invoke the real Linux compiler directly, including the installed 0.72 layout fix.
+Public Function StudioNativeCompilerArgs(compiler As String, target As String) As Array Of String
+    Dim argv As Array Of String = Array.AsResizable([compiler])
+    #If TargetLinux Then
+        If compiler = "/usr/bin/buoy" Then
+            Dim triple As String = "x86_64-unknown-linux-gnu"
+            Select Case target
+                Case "arm64-darwin"
+                    triple = "arm64-apple-macos"
+                Case "x86_64-darwin"
+                    triple = "x86_64-apple-macos"
+                Case "arm64-windows"
+                    triple = "arm64-pc-windows-msvc"
+                Case "x86_64-windows"
+                    triple = "x86_64-pc-windows-msvc"
+            End Select
+            Dim stubs As String = triple
+            If target = "arm64-linux" Then
+                triple = "aarch64-unknown-linux-gnu"
+                stubs = "arm64-unknown-linux-gnu"
+            End If
+            Array.Append(argv, "-L/usr/lib/buoy/runtime/" + triple)
+            Array.Append(argv, "--stubs-dir")
+            Array.Append(argv, "/usr/lib/buoy/stubs/" + stubs)
+            If String.EndsWith(target, "-linux") Then
+                Array.Append(argv, "--extra-obj")
+                Array.Append(argv, "/usr/lib/buoy/crt/" + triple + "/crt0.o")
+            End If
+        End If
+    #End If
+    Return argv
+End Function
+
+Public Sub StudioNativeStore(filename As String)
+    Dim input As Result Of ZipReader, ZipError = ZipReader.Open(filename)
+    DevNeed(input.IsOk, "Cannot open package " + filename)
+    Dim created As Result Of ZipWriter, ZipError = ZipWriter.Create(filename + ".stored")
+    DevNeed(created.IsOk, "Cannot normalize package " + filename)
+    Dim reader As ZipReader = input.Value
+    Dim writer As ZipWriter = created.Value
+    writer.CompressMethod = CompressMethods.Store
+    Try
+        Dim found As Boolean = reader.GotoFirstEntry()
+        While found
+            Dim entry As ZipEntry = reader.CurrentEntry
+            If Not entry.IsDirectory Then
+                Dim bytes As Optional Of Bytes = reader.ExtractCurrentEntryToBytes()
+                DevNeed(bytes.HasValue, "Corrupt package entry: " + entry.Name)
+                DevNeed(writer.AddBytes(bytes.Value, entry.Name), "Cannot write package entry: " + entry.Name)
+            End If
+            found = reader.GotoNextEntry()
+        End While
+    Finally
+        reader.Close()
+        writer.Close()
+    End Try
+    DevNeed(New FileSystemItem(filename + ".stored").MoveTo(New FileSystemItem(filename)), "Cannot publish stored package " + filename)
+End Sub
+
+Public Sub StudioNativeResource(resources As JSONItem, root As String, work As String, relative As String, name As String)
+    StudioNativeCopy(Path.Join(root, relative), Path.Join(work, "resources/" + name))
+    Dim entry As JSONItem = JSONItem.NewObject()
+    entry.Value("kind") = "Resource"
+    entry.Value("path") = name
+    resources.Add(entry)
+End Sub
+
+Public Function StudioNativeInputs(root As String) As JSONItem
+    Dim inputs As JSONItem = JSONItem.NewArray()
+    For Each relative As String In StudioNativeFiles(root)
+        Dim item As JSONItem = JSONItem.NewObject()
+        item.Value("path") = relative
+        item.Value("sha256") = StudioNativeHash(Path.Join(root, relative))
+        inputs.Add(item)
+    Next
+    Return inputs
+End Function

@@ -1,0 +1,1138 @@
+{
+  "schema": 1,
+  "keywords": [
+    {
+      "name": "Abstract",
+      "stem": "classes",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Abstract')"
+    },
+    {
+      "name": "AddHandler",
+      "stem": "events",
+      "reserved": false,
+      "probe": "Accepted as a local identifier"
+    },
+    {
+      "name": "AddressOf",
+      "stem": "delegates",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'AddressOf')"
+    },
+    {
+      "name": "Alias",
+      "stem": "ffi-declare",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Alias')"
+    },
+    {
+      "name": "And",
+      "stem": "arithmetic-operators",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'And')"
+    },
+    {
+      "name": "Array",
+      "stem": "reserved-words",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Array')"
+    },
+    {
+      "name": "As",
+      "stem": "variables-and-constants",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'As')"
+    },
+    {
+      "name": "Assert",
+      "stem": "assert",
+      "reserved": false,
+      "probe": "Accepted as a local identifier"
+    },
+    {
+      "name": "Assigns",
+      "stem": "assigns-params",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Assigns')"
+    },
+    {
+      "name": "Async",
+      "stem": "async-await",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Async')"
+    },
+    {
+      "name": "Await",
+      "stem": "async-await",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Await')"
+    },
+    {
+      "name": "Block",
+      "stem": "block-literals",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Block')"
+    },
+    {
+      "name": "Boolean",
+      "stem": "reserved-words",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Boolean')"
+    },
+    {
+      "name": "Break",
+      "stem": "break",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Break')"
+    },
+    {
+      "name": "ByRef",
+      "stem": "functions-and-subs",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'ByRef')"
+    },
+    {
+      "name": "ByVal",
+      "stem": "functions-and-subs",
+      "reserved": false,
+      "probe": "Accepted as a local identifier"
+    },
+    {
+      "name": "Call",
+      "stem": "call-statement",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Call')"
+    },
+    {
+      "name": "Case",
+      "stem": "control-flow",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Case')"
+    },
+    {
+      "name": "Catch",
+      "stem": "exceptions",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Catch')"
+    },
+    {
+      "name": "CFStringRef",
+      "stem": "cfstringref",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'CFStringRef')"
+    },
+    {
+      "name": "Chr",
+      "stem": "strings",
+      "reserved": false,
+      "probe": "Accepted as a local identifier"
+    },
+    {
+      "name": "Class",
+      "stem": "classes",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Class')"
+    },
+    {
+      "name": "Closure",
+      "stem": "closures",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Closure')"
+    },
+    {
+      "name": "Condition",
+      "stem": "condition",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Condition')"
+    },
+    {
+      "name": "Const",
+      "stem": "variables-and-constants",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Const')"
+    },
+    {
+      "name": "Constant",
+      "stem": "constant",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Constant')"
+    },
+    {
+      "name": "Constructor",
+      "stem": "classes",
+      "reserved": false,
+      "probe": "Accepted as a local identifier"
+    },
+    {
+      "name": "Continue",
+      "stem": "control-flow",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Continue')"
+    },
+    {
+      "name": "CStr",
+      "stem": "strings",
+      "reserved": false,
+      "probe": "Accepted as a local identifier"
+    },
+    {
+      "name": "CString",
+      "stem": "cstring",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'CString')"
+    },
+    {
+      "name": "CType",
+      "stem": "interfaces",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'CType')"
+    },
+    {
+      "name": "Currency",
+      "stem": "currency",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Currency')"
+    },
+    {
+      "name": "Declare",
+      "stem": "ffi-declare",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Declare')"
+    },
+    {
+      "name": "Default",
+      "stem": "default-parameters",
+      "reserved": false,
+      "probe": "Accepted as a local identifier"
+    },
+    {
+      "name": "Defined",
+      "stem": "conditional-compilation",
+      "reserved": false,
+      "probe": "Accepted as a local identifier"
+    },
+    {
+      "name": "Delegate",
+      "stem": "delegates",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Delegate')"
+    },
+    {
+      "name": "Destructor",
+      "stem": "classes",
+      "reserved": false,
+      "probe": "Accepted as a local identifier"
+    },
+    {
+      "name": "Dim",
+      "stem": "variables-and-constants",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Dim')"
+    },
+    {
+      "name": "Do",
+      "stem": "control-flow",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Do')"
+    },
+    {
+      "name": "Double",
+      "stem": "reserved-words",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Double')"
+    },
+    {
+      "name": "Downto",
+      "stem": "control-flow",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Downto')"
+    },
+    {
+      "name": "Each",
+      "stem": "control-flow",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Each')"
+    },
+    {
+      "name": "Else",
+      "stem": "control-flow",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Else')"
+    },
+    {
+      "name": "ElseIf",
+      "stem": "control-flow",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'ElseIf')"
+    },
+    {
+      "name": "End",
+      "stem": "control-flow",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'End')"
+    },
+    {
+      "name": "Enum",
+      "stem": "enums",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Enum')"
+    },
+    {
+      "name": "Err",
+      "stem": "optional-and-result",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Err')"
+    },
+    {
+      "name": "Event",
+      "stem": "events",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Event')"
+    },
+    {
+      "name": "Exit",
+      "stem": "control-flow",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Exit')"
+    },
+    {
+      "name": "Export",
+      "stem": "export",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Export')"
+    },
+    {
+      "name": "Extension",
+      "stem": "extension-methods",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Extension')"
+    },
+    {
+      "name": "False",
+      "stem": "variables-and-constants",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'False')"
+    },
+    {
+      "name": "Final",
+      "stem": "classes",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Final')"
+    },
+    {
+      "name": "Finally",
+      "stem": "exceptions",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Finally')"
+    },
+    {
+      "name": "Flags",
+      "stem": "enums",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Flags')"
+    },
+    {
+      "name": "For",
+      "stem": "control-flow",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'For')"
+    },
+    {
+      "name": "Format",
+      "stem": "strings",
+      "reserved": false,
+      "probe": "Accepted as a local identifier"
+    },
+    {
+      "name": "Function",
+      "stem": "functions-and-subs",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Function')"
+    },
+    {
+      "name": "Get",
+      "stem": "properties",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Get')"
+    },
+    {
+      "name": "Handle",
+      "stem": "events",
+      "reserved": false,
+      "probe": "Accepted as a local identifier"
+    },
+    {
+      "name": "If",
+      "stem": "control-flow",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'If')"
+    },
+    {
+      "name": "Implements",
+      "stem": "interfaces",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Implements')"
+    },
+    {
+      "name": "Import",
+      "stem": "modules",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Import')"
+    },
+    {
+      "name": "In",
+      "stem": "for-each",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'In')"
+    },
+    {
+      "name": "Inherits",
+      "stem": "inheritance",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Inherits')"
+    },
+    {
+      "name": "Inline",
+      "stem": "inline-functions",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Inline')"
+    },
+    {
+      "name": "Int16",
+      "stem": "sized-integers",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Int16')"
+    },
+    {
+      "name": "Int32",
+      "stem": "sized-integers",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Int32')"
+    },
+    {
+      "name": "Int64",
+      "stem": "sized-integers",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Int64')"
+    },
+    {
+      "name": "Int8",
+      "stem": "sized-integers",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Int8')"
+    },
+    {
+      "name": "Integer",
+      "stem": "reserved-words",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Integer')"
+    },
+    {
+      "name": "Interface",
+      "stem": "interfaces",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Interface')"
+    },
+    {
+      "name": "Internal",
+      "stem": "internal-access-modifier",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Internal')"
+    },
+    {
+      "name": "Is",
+      "stem": "object",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Is')"
+    },
+    {
+      "name": "IsA",
+      "stem": "interfaces",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'IsA')"
+    },
+    {
+      "name": "IsNot",
+      "stem": "object",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'IsNot')"
+    },
+    {
+      "name": "Lambda",
+      "stem": "closures",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Lambda')"
+    },
+    {
+      "name": "Lazy",
+      "stem": "lazy-property",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Lazy')"
+    },
+    {
+      "name": "Len",
+      "stem": "strings",
+      "reserved": false,
+      "probe": "Accepted as a local identifier"
+    },
+    {
+      "name": "Lib",
+      "stem": "ffi-declare",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Lib')"
+    },
+    {
+      "name": "Localization",
+      "stem": "localization",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Localization')"
+    },
+    {
+      "name": "Loop",
+      "stem": "control-flow",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Loop')"
+    },
+    {
+      "name": "MainThread",
+      "stem": "runloop",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'MainThread')"
+    },
+    {
+      "name": "Math",
+      "stem": "standard-library",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Math')"
+    },
+    {
+      "name": "Me",
+      "stem": "classes",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Me')"
+    },
+    {
+      "name": "MessageBox",
+      "stem": "message-box",
+      "reserved": false,
+      "probe": "Accepted as a local identifier"
+    },
+    {
+      "name": "Microseconds",
+      "stem": "microseconds",
+      "reserved": false,
+      "probe": "Accepted as a local identifier"
+    },
+    {
+      "name": "Mod",
+      "stem": "arithmetic-operators",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Mod')"
+    },
+    {
+      "name": "Module",
+      "stem": "modules",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Module')"
+    },
+    {
+      "name": "Mutex",
+      "stem": "synclock",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Mutex')"
+    },
+    {
+      "name": "Namespace",
+      "stem": "namespaces",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Namespace')"
+    },
+    {
+      "name": "New",
+      "stem": "classes",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'New')"
+    },
+    {
+      "name": "Next",
+      "stem": "control-flow",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Next')"
+    },
+    {
+      "name": "Nil",
+      "stem": "object",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Nil')"
+    },
+    {
+      "name": "None",
+      "stem": "optional-and-result",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'None')"
+    },
+    {
+      "name": "Not",
+      "stem": "arithmetic-operators",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Not')"
+    },
+    {
+      "name": "Of",
+      "stem": "generics",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Of')"
+    },
+    {
+      "name": "Ok",
+      "stem": "optional-and-result",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Ok')"
+    },
+    {
+      "name": "Operator",
+      "stem": "operator-overloading",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Operator')"
+    },
+    {
+      "name": "Optional",
+      "stem": "reserved-words",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Optional')"
+    },
+    {
+      "name": "Or",
+      "stem": "arithmetic-operators",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Or')"
+    },
+    {
+      "name": "Overrides",
+      "stem": "inheritance",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Overrides')"
+    },
+    {
+      "name": "Package",
+      "stem": "package-import",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Package')"
+    },
+    {
+      "name": "Packed",
+      "stem": "structures",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Packed')"
+    },
+    {
+      "name": "ParamArray",
+      "stem": "paramarray",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'ParamArray')"
+    },
+    {
+      "name": "Partial",
+      "stem": "partial-classes",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Partial')"
+    },
+    {
+      "name": "Path",
+      "stem": "reserved-words",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Path')"
+    },
+    {
+      "name": "Print",
+      "stem": "console-io",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Print')"
+    },
+    {
+      "name": "Private",
+      "stem": "shared-members",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Private')"
+    },
+    {
+      "name": "Property",
+      "stem": "properties",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Property')"
+    },
+    {
+      "name": "Protected",
+      "stem": "shared-members",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Protected')"
+    },
+    {
+      "name": "Ptr",
+      "stem": "reserved-words",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Ptr')"
+    },
+    {
+      "name": "Public",
+      "stem": "shared-members",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Public')"
+    },
+    {
+      "name": "raise",
+      "stem": "reserved-words",
+      "reserved": false,
+      "probe": "Accepted as a local identifier"
+    },
+    {
+      "name": "RaiseEvent",
+      "stem": "events",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'RaiseEvent')"
+    },
+    {
+      "name": "Random",
+      "stem": "standard-library",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Random')"
+    },
+    {
+      "name": "ReadOnly",
+      "stem": "properties",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'ReadOnly')"
+    },
+    {
+      "name": "Redim",
+      "stem": "arrays",
+      "reserved": false,
+      "probe": "Accepted as a local identifier"
+    },
+    {
+      "name": "RemoveHandler",
+      "stem": "events",
+      "reserved": false,
+      "probe": "Accepted as a local identifier"
+    },
+    {
+      "name": "Result",
+      "stem": "reserved-words",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Result')"
+    },
+    {
+      "name": "Return",
+      "stem": "functions-and-subs",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Return')"
+    },
+    {
+      "name": "RunLoop",
+      "stem": "runloop",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'RunLoop')"
+    },
+    {
+      "name": "Select",
+      "stem": "control-flow",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Select')"
+    },
+    {
+      "name": "Selector",
+      "stem": "declare-selector",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Selector')"
+    },
+    {
+      "name": "Sequential",
+      "stem": "structures",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Sequential')"
+    },
+    {
+      "name": "Set",
+      "stem": "properties",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Set')"
+    },
+    {
+      "name": "Shared",
+      "stem": "shared-members",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Shared')"
+    },
+    {
+      "name": "Single",
+      "stem": "reserved-words",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Single')"
+    },
+    {
+      "name": "Sleep",
+      "stem": "sleep",
+      "reserved": false,
+      "probe": "Accepted as a local identifier"
+    },
+    {
+      "name": "Some",
+      "stem": "optional-and-result",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Some')"
+    },
+    {
+      "name": "static",
+      "stem": "reserved-words",
+      "reserved": false,
+      "probe": "Accepted as a local identifier"
+    },
+    {
+      "name": "StdErr",
+      "stem": "console-io",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'StdErr')"
+    },
+    {
+      "name": "StdIn",
+      "stem": "console-io",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'StdIn')"
+    },
+    {
+      "name": "StdOut",
+      "stem": "console-io",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'StdOut')"
+    },
+    {
+      "name": "Step",
+      "stem": "control-flow",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Step')"
+    },
+    {
+      "name": "Str",
+      "stem": "strings",
+      "reserved": false,
+      "probe": "Accepted as a local identifier"
+    },
+    {
+      "name": "String",
+      "stem": "reserved-words",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'String')"
+    },
+    {
+      "name": "Structure",
+      "stem": "structures",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Structure')"
+    },
+    {
+      "name": "Sub",
+      "stem": "functions-and-subs",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Sub')"
+    },
+    {
+      "name": "Super",
+      "stem": "inheritance",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Super')"
+    },
+    {
+      "name": "SyncLock",
+      "stem": "synclock",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'SyncLock')"
+    },
+    {
+      "name": "Task",
+      "stem": "task",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Task')"
+    },
+    {
+      "name": "Then",
+      "stem": "control-flow",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Then')"
+    },
+    {
+      "name": "Thread",
+      "stem": "thread",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Thread')"
+    },
+    {
+      "name": "Throw",
+      "stem": "exceptions",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Throw')"
+    },
+    {
+      "name": "To",
+      "stem": "control-flow",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'To')"
+    },
+    {
+      "name": "Treat",
+      "stem": "treat-narrowing",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Treat')"
+    },
+    {
+      "name": "True",
+      "stem": "variables-and-constants",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'True')"
+    },
+    {
+      "name": "Try",
+      "stem": "exceptions",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Try')"
+    },
+    {
+      "name": "TryCast",
+      "stem": "interfaces",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'TryCast')"
+    },
+    {
+      "name": "UInt16",
+      "stem": "sized-integers",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'UInt16')"
+    },
+    {
+      "name": "UInt32",
+      "stem": "sized-integers",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'UInt32')"
+    },
+    {
+      "name": "UInt64",
+      "stem": "sized-integers",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'UInt64')"
+    },
+    {
+      "name": "UInt8",
+      "stem": "sized-integers",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'UInt8')"
+    },
+    {
+      "name": "Until",
+      "stem": "control-flow",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Until')"
+    },
+    {
+      "name": "Using",
+      "stem": "closures",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Using')"
+    },
+    {
+      "name": "Val",
+      "stem": "strings",
+      "reserved": false,
+      "probe": "Accepted as a local identifier"
+    },
+    {
+      "name": "Value",
+      "stem": "properties",
+      "reserved": false,
+      "probe": "Accepted as a local identifier"
+    },
+    {
+      "name": "Var",
+      "stem": "variables-and-constants",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Var')"
+    },
+    {
+      "name": "Weak",
+      "stem": "memory-management",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Weak')"
+    },
+    {
+      "name": "Wend",
+      "stem": "control-flow",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Wend')"
+    },
+    {
+      "name": "when",
+      "stem": "reserved-words",
+      "reserved": false,
+      "probe": "Accepted as a local identifier"
+    },
+    {
+      "name": "While",
+      "stem": "control-flow",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'While')"
+    },
+    {
+      "name": "With",
+      "stem": "with",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'With')"
+    },
+    {
+      "name": "Xor",
+      "stem": "arithmetic-operators",
+      "upstreamReserved": true,
+      "reserved": true,
+      "probe": "expected variable name after Dim (got 'Xor')"
+    }
+  ],
+  "compiler": "buoy version 0.72.0"
+}

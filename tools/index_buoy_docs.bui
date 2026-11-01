@@ -1,0 +1,19 @@
+' Buoy command-line entrypoint for the existing JavaScript engine.
+Import helper_runtime
+
+Function Main(args As Array Of String) As Integer
+    If args.Count > 1 Then
+        If args(1) = "--help" Or args(1) = "-h" Then
+            Print "Usage: ahoy tools/index_buoy_docs.bui [documentation-directory]"
+            Print "Index local Buoy documentation using Node, markdown-it, and linkedom."
+            Print "Writes apps/BuoyDocs/snapshot/docs.json; defaults to /Applications/Buoy/docs."
+            Return 0
+        End If
+    End If
+    Dim root As String = helper_runtime.WorkspaceRoot()
+    Dim command As String = "node " + helper_runtime.Q(Path.Join(root, "tools/index_buoy_docs.cjs"))
+    For i As Integer = 1 To args.Count - 1
+        command = command + " " + helper_runtime.Q(args(i))
+    Next
+    Return helper_runtime.Run(command)
+End Function

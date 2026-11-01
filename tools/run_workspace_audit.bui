@@ -1,0 +1,285 @@
+' Curated audit orchestration in Buoy. POSIX; requires GNU timeout (or gtimeout)
+' and python3 for the inventory's existing Python test payloads.
+Import helper_runtime As H
+Declare Function WaitCommand Lib "c" Alias "system" (command As String) As Int32
+Declare Sub ExitProcess Lib "c" Alias "exit" (code As Int32)
+
+Function Has(values As Array Of String, wanted As String) As Boolean
+    For Each value As String In values
+        If value = wanted Then Return True
+    Next
+    Return False
+End Function
+
+' Return an escaped JSON string literal: native String/JSON round trips lose NUL.
+' Replace malformed UTF-8 using maximal valid prefixes, as Python errors=replace.
+Function DecodeOutput(data As Bytes) As String
+    Dim clean As New Bytes
+    clean.Append(34)
+    Dim i As Integer = 0
+    While i < data.Count
+        Dim first As Integer = data.Item(i)
+        If first < 128 Then
+            If first < 32 Then
+                clean.Append(Bytes.FromString("\\u00", Text.Encodings.UTF8))
+                clean.Append(48 + first \ 16)
+                Dim digit As Integer = first Mod 16
+                If digit < 10 Then
+                    clean.Append(48 + digit)
+                Else
+                    clean.Append(87 + digit)
+                End If
+            Else
+                If first = 34 Or first = 92 Then clean.Append(92)
+                clean.Append(first)
+            End If
+            i += 1
+            Continue While
+        End If
+        Dim width As Integer = 0
+        If first >= 194 And first <= 223 Then width = 2
+        If first >= 224 And first <= 239 Then width = 3
+        If first >= 240 And first <= 244 Then width = 4
+        Dim consumed As Integer = 1
+        While consumed < width And i + consumed < data.Count
+            Dim following As Integer = data.Item(i + consumed)
+            If following < 128 Or following > 191 Then Exit While
+            If consumed = 1 Then
+                If first = 224 And following < 160 Then Exit While
+                If first = 237 And following > 159 Then Exit While
+                If first = 240 And following < 144 Then Exit While
+                If first = 244 And following > 143 Then Exit While
+            End If
+            consumed += 1
+        Wend
+        If width > 0 And consumed = width Then
+            For offset As Integer = 0 To width - 1
+                clean.Append(data.Item(i + offset))
+            Next
+        Else
+            clean.Append(239)
+            clean.Append(191)
+            clean.Append(189)
+        End If
+        i += consumed
+    Wend
+    clean.Append(34)
+    Return clean.ToString(Text.Encodings.UTF8)
+End Function
+
+Function RunSuite(suite As JSONItem, seconds As Double, root As String, timer As String, runner As String) As JSONItem
+    Dim outcome As JSONItem = Json.Parse("{}")
+    Dim component As String = suite.Value("component").AsString().Value
+    Dim relative As String = suite.Value("path").AsString().Value
+    outcome.Value("component") = component
+    outcome.Value("path") = relative
+    Dim command As JSONItem = Json.Parse("[]")
+    command.Add(JSONItem.From("python3"))
+    command.Add(JSONItem.From(Path.Join(root, relative)))
+    outcome.Value("command") = command
+    Dim start As Integer = System.Microseconds()
+    Dim work As String = H.TempDirectory("buoy-audit-")
+    Try
+        Dim output As String = Path.Join(work, "output")
+        Dim status As String = Path.Join(work, "status")
+        H.WriteText(output, "")
+        ' Capture only the suite, excluding shell diagnostics when timeout kills it.
+        ' Separate status file distinguishes a suite exiting 124/137 from timeout.
+        Dim body As String = H.Q(runner) + " --audit-child " + H.Q(Path.Join(root, relative)) + " " + H.Q(output) + " " + H.Q(status)
+        Dim code As Integer = H.Run(H.Q(timer) + " --signal=KILL " + H.Q(Str(seconds)) + " " + body + " > /dev/null 2>&1", root)
+        Dim state As String = "timeout"
+        Dim statusFile As New FileSystemItem(status)
+        If statusFile.IsFile() Then
+            code = Integer.Parse(H.ReadText(status)).Value
+            state = "failed"
+            If code = 0 Then state = "passed"
+        ElseIf code = 137 Then
+            code = -9
+        Else
+            state = "error"
+            outcome.Value("error") = "Cannot launch bounded process; exit " + Str(code)
+        End If
+        outcome.Value("status") = state
+        outcome.Value("returncode") = code
+        Dim size As Integer = Integer.Parse(String.Trim(H.Capture("wc -c < " + H.Q(output)))).Value
+        ' tail reads at most 16000 bytes even for very large suite logs.
+        Dim tailFile As String = Path.Join(work, "tail")
+        H.RequireRun("tail -c 16000 " + H.Q(output) + " > " + H.Q(tailFile))
+        Dim stream As BinaryStream = BinaryStream.Open(New FileSystemItem(tailFile), False).Value
+        Dim tail As Bytes = stream.Read(stream.Length)
+        stream.Close()
+        outcome.Value("output_tail_json") = DecodeOutput(tail)
+        outcome.Value("output_truncated") = size > 16000
+    Finally
+        H.RemoveTree(work)
+    End Try
+    outcome.Value("duration_seconds") = (System.Microseconds() - start) / 1000000.0
+    Return outcome
+End Function
+
+#If TargetWindows Then
+Private Declare Function ReplaceReport Lib "kernel32" Alias "MoveFileExW" (source As Ptr, destination As Ptr, options As UInt32) As Int32
+#End If
+
+Sub WriteReport(reportPath As String, results As JSONItem, seconds As Double, complete As Boolean, success As Boolean)
+    If reportPath = "" Then Return
+    Dim report As JSONItem = Json.Parse("{}")
+    report.Value("schema_version") = 1
+    report.Value("timeout_seconds") = seconds
+    report.Value("complete") = complete
+    report.Value("success") = complete And success
+    ' Clone each entry: later snapshots still need its escaped binary output.
+    Dim resultJSON As String = "["
+    For index As Integer = 0 To results.Count() - 1
+        Dim entry As JSONItem = Json.Parse(Json.Stringify(results.ValueAt(index)))
+        Dim tailJSON As String = entry.Value("output_tail_json").AsString().Value
+        entry.Remove("output_tail_json")
+        entry.Value("output_tail") = JSONItem.Null()
+        If index > 0 Then resultJSON += ","
+        resultJSON += String.Replace(Json.Stringify(entry), "\"output_tail\":null", "\"output_tail\":" + tailJSON, 1, True)
+    Next
+    resultJSON += "]"
+    report.Value("results") = Json.Parse("[]")
+    Dim reportJSON As String = String.Replace(Json.Stringify(report), "\"results\":[]", "\"results\":" + resultJSON, 1, True)
+    Dim destination As New FileSystemItem(reportPath)
+    Dim parent As String = destination.ParentPath()
+    If parent = "" Then parent = "."
+    H.MakeDirectory(parent)
+    ' Same-parent staging keeps replacement on the destination filesystem.
+    Dim temporary As String = String.Trim(H.Capture("mktemp -d " + H.Q(Path.Join(parent, ".audit-report-XXXXXX"))))
+    Try
+        Dim file As New FileSystemItem(Path.Join(temporary, "report.json"))
+        Dim content As String = reportJSON + "\n"
+        H.WriteText(file.FullPath(), content)
+        ' BUI-508: WriteAllText can report success after a short write.
+        If String.Compare(H.ReadText(file.FullPath()), content, True) <> 0 Then Throw New IOException("Incomplete report write: " + reportPath)
+        #If TargetWindows Then
+            Dim sourceWide As Bytes = Bytes.FromString(file.FullPath(), Text.Encodings.UTF16LE)
+            sourceWide.Append(0)
+            sourceWide.Append(0)
+            Dim destinationWide As Bytes = Bytes.FromString(destination.FullPath(), Text.Encodings.UTF16LE)
+            destinationWide.Append(0)
+            destinationWide.Append(0)
+            If ReplaceReport(sourceWide.DataPtr(), destinationWide.DataPtr(), 9) = 0 Then Throw New IOException("Cannot replace report: " + reportPath)
+        #Else
+            If Not file.MoveTo(destination) Then Throw New IOException("Cannot replace report: " + reportPath)
+        #End If
+    Finally
+        H.RemoveTree(temporary)
+    End Try
+End Sub
+
+Sub Main(args As Array Of String)
+    Try
+        If Array.Count(args) = 5 And args(1) = "--audit-child" Then
+            ' exec makes the shell's raw wait status belong to Python itself.
+            ' Keep signals distinct from ordinary exits such as 143 or 137.
+            Dim raw As Integer = WaitCommand("exec python3 " + H.Q(args(2)) + " > " + H.Q(args(3)) + " 2>&1")
+            Dim code As Integer = raw
+            If raw >= 0 Then
+                code = (raw \ 256) Mod 256
+                If raw Mod 128 <> 0 Then code = -(raw Mod 128)
+            End If
+            H.WriteText(args(4), Str(code))
+            Return
+        End If
+        Dim components As Array Of String = []
+        Dim listing As Boolean = False
+        Dim seconds As Double = 180.0
+        Dim reportPath As String = ""
+        Dim i As Integer = 1
+        While i < Array.Count(args)
+            Dim option As String = args(i)
+            If option = "--help" Or option = "-h" Then
+                Print "Usage: ahoy tools/run_workspace_audit.bui [--list] [--component NAME] [--timeout SECONDS] [--report PATH]"
+                Print "Requires python3 and GNU timeout (timeout or gtimeout)."
+                Return
+            ElseIf option = "--list" Then
+                listing = True
+            ElseIf option = "--component" Or option = "--timeout" Or option = "--report" Then
+                i += 1
+                If i >= Array.Count(args) Then Throw New RuntimeException("Missing value for " + option)
+                If option = "--component" Then
+                    Array.Append(components, args(i))
+                ElseIf option = "--timeout" Then
+                    Dim parsed As Result Of Double, String = Double.Parse(args(i))
+                    If parsed.IsErr Then Throw New RuntimeException("--timeout must be positive and finite")
+                    seconds = parsed.Value
+                Else
+                    reportPath = args(i)
+                End If
+            Else
+                Throw New RuntimeException("Unknown argument: " + option)
+            End If
+            i += 1
+        Wend
+        If Not (seconds > 0.0) Or (seconds - seconds) <> 0.0 Then Throw New RuntimeException("--timeout must be positive and finite")
+        Dim root As String = H.WorkspaceRoot()
+        Dim inventory As JSONItem = Json.Parse(H.ReadText(Path.Join(root, "tests/workspace-audit/test-coverage.json")))
+        Dim suites As JSONItem = inventory.Value("suites")
+        If Not suites.IsArray() Then Throw New RuntimeException("Inventory suites must be an array")
+        Dim known As Array Of String = []
+        For index As Integer = 0 To suites.Count() - 1
+            Dim entry As JSONItem = suites.ValueAt(index)
+            If Not entry.Value("component").IsString() Or Not entry.Value("path").IsString() Then Throw New RuntimeException("Invalid suite component or path")
+            Array.Append(known, entry.Value("component").AsString().Value)
+        Next
+        For Each component As String In components
+            If Not Has(known, component) Then Throw New RuntimeException("Unknown component(s): " + component)
+        Next
+        Dim selected As JSONItem = Json.Parse("[]")
+        For index As Integer = 0 To suites.Count() - 1
+            Dim entry As JSONItem = suites.ValueAt(index)
+            Dim component As String = entry.Value("component").AsString().Value
+            If Array.Count(components) > 0 Then
+                If Not Has(components, component) Then Continue For
+            ElseIf Not listing And entry.Value("optional").AsBoolean().Or(False) Then
+                Continue For
+            End If
+            Dim relative As String = entry.Value("path").AsString().Value
+            Dim unsafe As Boolean = String.StartsWith(relative, "/", True)
+            For Each part As String In String.Split(relative, "/")
+                If part = ".." Then unsafe = True
+            Next
+            Dim source As New FileSystemItem(Path.Join(root, relative))
+            If unsafe Or Not source.IsFile() Then Throw New RuntimeException("Missing or invalid suite path: " + relative)
+            selected.Add(entry)
+        Next
+        Dim runner As String = ""
+        If Not listing Then
+            Dim executable As FileSystemItem = FileSystemItem.ExecutableFile()
+            If executable = Nil Then Throw New RuntimeException("Cannot locate audit runner executable")
+            runner = executable.FullPath()
+        End If
+        Dim timer As String = ""
+        If Not listing Then timer = String.Trim(H.Capture("command -v timeout || command -v gtimeout"))
+        Dim results As JSONItem = Json.Parse("[]")
+        Dim success As Boolean = True
+        If Not listing Then WriteReport(reportPath, results, seconds, False, success)
+        For index As Integer = 0 To selected.Count() - 1
+            Dim suite As JSONItem = selected.ValueAt(index)
+            Dim component As String = suite.Value("component").AsString().Value
+            If Array.Count(components) > 0 And Not Has(components, component) Then Continue For
+            If listing Then
+                Print component + ": " + suite.Value("path").AsString().Value
+            Else
+                Dim outcome As JSONItem = RunSuite(suite, seconds, root, timer, runner)
+                results.Add(outcome)
+                If outcome.Value("status").AsString().Value <> "passed" Then success = False
+                WriteReport(reportPath, results, seconds, False, success)
+                Print component + ": " + outcome.Value("status").AsString().Value + " (" + Json.Stringify(outcome.Value("duration_seconds")) + "s)"
+                StdOut.Flush()
+                If outcome.Value("status").AsString().Value <> "passed" Then
+                    success = False
+                    Print Json.Parse(outcome.Value("output_tail_json").AsString().Value).AsString().Or("")
+                End If
+            End If
+        Next
+        If listing Then Return
+        WriteReport(reportPath, results, seconds, True, success)
+        If Not success Then ExitProcess(1)
+    Catch e As Exception
+        StdErr.WriteLine(e.Message)
+        ExitProcess(2)
+    End Try
+End Sub

@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "compiler": "buoy",
+  "timeout": 90,
+  "log_limit": 1048576,
+  "tests": [],
+  "tasks": {}
+}

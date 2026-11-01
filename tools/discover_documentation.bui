@@ -1,0 +1,1311 @@
+' Offline documentation discovery. All parsing/rendering/indexing runs in Buoy.
+Import "buoydev/Common"
+Import regex.Regex
+Import zip.Zip
+
+Import crypto.Crypto
+Function ParseJSON(source As String, integralSchema As Boolean = False) As JSONItem
+    Dim data As Bytes = Bytes.FromString(source, Text.Encodings.UTF8)
+    DevNeed(data.Count <= 128 * MiB, "JSON exceeds 128 MiB")
+    Dim frames As Array Of JSONItem = []
+    Dim i As Integer = 0
+    While i < data.Count
+        Dim ch As Integer = data.Item(i)
+        If ch = 123 Or ch = 91 Then
+            Dim frame As JSONItem = JSONItem.NewObject()
+            frame.Value("object") = ch = 123
+            frame.Value("key") = True
+            frame.Value("keys") = JSONItem.NewObject()
+            Array.Append(frames, frame)
+            DevNeed(frames.Count <= 128, "JSON nesting exceeds 128")
+        ElseIf ch = 125 Or ch = 93 Then
+            If frames.Count > 0 Then Array.RemoveAt(frames, frames.Count - 1)
+        ElseIf ch = 44 Then
+            If frames.Count > 0 Then frames(frames.Count - 1).Value("key") = True
+        ElseIf ch = 34 Then
+            Dim start As Integer = i
+            i += 1
+            While i < data.Count
+                If data.Item(i) = 34 Then Exit While
+                If data.Item(i) = 92 Then
+                    If i + 5 < data.Count Then DevNeed(String.SubstringBytes(source, i, 6) <> "\\u0000", "NUL is unsupported by Buoy strings")
+                    i += 1
+                End If
+                i += 1
+            End While
+            If frames.Count > 0 Then
+                Dim frame As JSONItem = frames(frames.Count - 1)
+                If frame.Value("object").AsBoolean().Or(False) And frame.Value("key").AsBoolean().Or(False) Then
+                    Dim key As String = Json.Parse(String.SubstringBytes(source, start, i - start + 1)).AsString().Value
+                    Dim keys As JSONItem = frame.Value("keys")
+                    DevNeed(Not keys.HasKey(key), "duplicate JSON key: " + key)
+                    keys.Value(key) = True
+                    frame.Value("key") = False
+                    frame.Value("schema") = key = "schema"
+                End If
+            End If
+        ElseIf integralSchema And frames.Count = 1 And (ch >= 48 And ch <= 57) Then
+            If frames(0).Value("schema").AsBoolean().Or(False) Then
+                Dim ending As Integer = i
+                While ending < data.Count
+                    Dim nextByte As Integer = data.Item(ending)
+                    If nextByte = 44 Or nextByte = 125 Or nextByte <= 32 Then Exit While
+                    ending += 1
+                End While
+                DevNeed(Match(String.SubstringBytes(source, i, ending - i), "^[0-9]+$"), "invalid manifest schema")
+                i = ending - 1
+            End If
+        ElseIf ch = 78 Or ch = 73 Or ch = 45 Then
+            Dim word As String = String.SubstringBytes(source, i, 9)
+            For Each invalid As String In ["NaN", "Infinity", "-Infinity"]
+                If String.StartsWith(word, invalid, True) Then Throw New InvalidArgumentException("invalid JSON number: " + invalid)
+            Next
+        End If
+        i += 1
+    End While
+    Return Json.Parse(source)
+End Function
+
+Const DocsPrefix As String = "resources/buoy-docs/"
+Const MiB As Integer = 1048576
+
+Class RegexCache
+    Public Shared Property Values As Map Of String, Regex = New Map Of String, Regex()
+End Class
+
+Function RX(pattern As String) As Regex
+    Dim existing As Optional Of Regex = RegexCache.Values.Get(pattern)
+    If existing.HasValue Then Return existing.Value
+    Dim compiled As Result Of Regex, RegexError = Regex.Compile("(*UCP)" + pattern)
+    DevNeed(compiled.IsOk, "invalid regular expression: " + pattern)
+    RegexCache.Values.Set(pattern, compiled.Value)
+    Return compiled.Value
+End Function
+
+Function Match(inputText As String, pattern As String) As Boolean
+    Return RX(pattern).Find(inputText).HasValue
+End Function
+
+Function Replace(inputText As String, pattern As String, replacement As String) As String
+    Return RX(pattern).ReplaceAll(inputText, replacement)
+End Function
+
+Function Hex4(number As Integer) As String
+    Dim output As String = ""
+    Dim digits As String = "0123456789abcdef"
+    For i As Integer = 0 To 3
+        output = String.Substring(digits, number Mod 16, 1) + output
+        number = number \ 16
+    Next
+    Return "\\u" + output
+End Function
+
+Function Serialize(value As JSONItem) As String
+    Dim source As String = Json.Stringify(value)
+    Dim data As Bytes = Bytes.FromString(source, Text.Encodings.UTF8)
+    Dim output As New Bytes
+    Dim i As Integer = 0
+    Dim quoted As Boolean = False
+    Dim escaped As Boolean = False
+    While i < data.Count
+        Dim firstByte As Integer = data.Item(i)
+        If firstByte < 128 Then
+            If firstByte = 34 And Not escaped Then quoted = Not quoted
+            If firstByte = 92 And quoted Then
+                escaped = Not escaped
+            Else
+                escaped = False
+            End If
+            output.Append(firstByte)
+            If Not quoted And (firstByte = 44 Or firstByte = 58) Then output.Append(32)
+            i += 1
+            Continue While
+        End If
+        Dim codepoint As Integer
+        Dim width As Integer
+        If firstByte < 224 Then
+            width = 2
+            codepoint = firstByte And 31
+        ElseIf firstByte < 240 Then
+            width = 3
+            codepoint = firstByte And 15
+        Else
+            width = 4
+            codepoint = firstByte And 7
+        End If
+        For j As Integer = 1 To width - 1
+            codepoint = codepoint * 64 + (data.Item(i + j) And 63)
+        Next
+        If codepoint <= 65535 Then
+            output.Append(Bytes.FromString(Hex4(codepoint), Text.Encodings.UTF8))
+        Else
+            codepoint -= 65536
+            output.Append(Bytes.FromString(Hex4(55296 + codepoint \ 1024) + Hex4(56320 + codepoint Mod 1024), Text.Encodings.UTF8))
+        End If
+        i += width
+    End While
+    Return output.ToString(Text.Encodings.UTF8)
+End Function
+
+Function S(value As JSONItem, key As String, fallback As String = "") As String
+    Return value.Value(key).AsString().Or(fallback)
+End Function
+
+Function Escape(inputText As String) As String
+    inputText = String.Replace(inputText, "&", "&amp;")
+    inputText = String.Replace(inputText, "<", "&lt;")
+    inputText = String.Replace(inputText, ">", "&gt;")
+    inputText = String.Replace(inputText, "\"", "&quot;")
+    Return String.Replace(inputText, "'", "&#x27;")
+End Function
+
+
+' HTML5 named character-reference table, as standardized by WHATWG.
+Class HTMLEntities
+    Private Shared Property NamedValues As JSONItem
+    Private Shared Property NumericValues As JSONItem
+    Public Shared Function Named(name As String) As JSONItem
+        If NamedValues = Nil Then NamedValues = Json.Parse("{\"Aacute\":\"Á\",\"aacute\":\"á\",\"Aacute;\":\"Á\",\"aacute;\":\"á\",\"Abreve;\":\"Ă\",\"abreve;\":\"ă\",\"ac;\":\"∾\",\"acd;\":\"∿\",\"acE;\":\"∾̳\",\"Acirc\":\"Â\",\"acirc\":\"â\",\"Acirc;\":\"Â\",\"acirc;\":\"â\",\"acute\":\"´\",\"acute;\":\"´\",\"Acy;\":\"А\",\"acy;\":\"а\",\"AElig\":\"Æ\",\"aelig\":\"æ\",\"AElig;\":\"Æ\",\"aelig;\":\"æ\",\"af;\":\"⁡\",\"Afr;\":\"𝔄\",\"afr;\":\"𝔞\",\"Agrave\":\"À\",\"agrave\":\"à\",\"Agrave;\":\"À\",\"agrave;\":\"à\",\"alefsym;\":\"ℵ\",\"aleph;\":\"ℵ\",\"Alpha;\":\"Α\",\"alpha;\":\"α\",\"Amacr;\":\"Ā\",\"amacr;\":\"ā\",\"amalg;\":\"⨿\",\"AMP\":\"&\",\"amp\":\"&\",\"AMP;\":\"&\",\"amp;\":\"&\",\"And;\":\"⩓\",\"and;\":\"∧\",\"andand;\":\"⩕\",\"andd;\":\"⩜\",\"andslope;\":\"⩘\",\"andv;\":\"⩚\",\"ang;\":\"∠\",\"ange;\":\"⦤\",\"angle;\":\"∠\",\"angmsd;\":\"∡\",\"angmsdaa;\":\"⦨\",\"angmsdab;\":\"⦩\",\"angmsdac;\":\"⦪\",\"angmsdad;\":\"⦫\",\"angmsdae;\":\"⦬\",\"angmsdaf;\":\"⦭\",\"angmsdag;\":\"⦮\",\"angmsdah;\":\"⦯\",\"angrt;\":\"∟\",\"angrtvb;\":\"⊾\",\"angrtvbd;\":\"⦝\",\"angsph;\":\"∢\",\"angst;\":\"Å\",\"angzarr;\":\"⍼\",\"Aogon;\":\"Ą\",\"aogon;\":\"ą\",\"Aopf;\":\"𝔸\",\"aopf;\":\"𝕒\",\"ap;\":\"≈\",\"apacir;\":\"⩯\",\"apE;\":\"⩰\",\"ape;\":\"≊\",\"apid;\":\"≋\",\"apos;\":\"'\",\"ApplyFunction;\":\"⁡\",\"approx;\":\"≈\",\"approxeq;\":\"≊\",\"Aring\":\"Å\",\"aring\":\"å\",\"Aring;\":\"Å\",\"aring;\":\"å\",\"Ascr;\":\"𝒜\",\"ascr;\":\"𝒶\",\"Assign;\":\"≔\",\"ast;\":\"*\",\"asymp;\":\"≈\",\"asympeq;\":\"≍\",\"Atilde\":\"Ã\",\"atilde\":\"ã\",\"Atilde;\":\"Ã\",\"atilde;\":\"ã\",\"Auml\":\"Ä\",\"auml\":\"ä\",\"Auml;\":\"Ä\",\"auml;\":\"ä\",\"awconint;\":\"∳\",\"awint;\":\"⨑\",\"backcong;\":\"≌\",\"backepsilon;\":\"϶\",\"backprime;\":\"‵\",\"backsim;\":\"∽\",\"backsimeq;\":\"⋍\",\"Backslash;\":\"∖\",\"Barv;\":\"⫧\",\"barvee;\":\"⊽\",\"Barwed;\":\"⌆\",\"barwed;\":\"⌅\",\"barwedge;\":\"⌅\",\"bbrk;\":\"⎵\",\"bbrktbrk;\":\"⎶\",\"bcong;\":\"≌\",\"Bcy;\":\"Б\",\"bcy;\":\"б\",\"bdquo;\":\"„\",\"becaus;\":\"∵\",\"Because;\":\"∵\",\"because;\":\"∵\",\"bemptyv;\":\"⦰\",\"bepsi;\":\"϶\",\"bernou;\":\"ℬ\",\"Bernoullis;\":\"ℬ\",\"Beta;\":\"Β\",\"beta;\":\"β\",\"beth;\":\"ℶ\",\"between;\":\"≬\",\"Bfr;\":\"𝔅\",\"bfr;\":\"𝔟\",\"bigcap;\":\"⋂\",\"bigcirc;\":\"◯\",\"bigcup;\":\"⋃\",\"bigodot;\":\"⨀\",\"bigoplus;\":\"⨁\",\"bigotimes;\":\"⨂\",\"bigsqcup;\":\"⨆\",\"bigstar;\":\"★\",\"bigtriangledown;\":\"▽\",\"bigtriangleup;\":\"△\",\"biguplus;\":\"⨄\",\"bigvee;\":\"⋁\",\"bigwedge;\":\"⋀\",\"bkarow;\":\"⤍\",\"blacklozenge;\":\"⧫\",\"blacksquare;\":\"▪\",\"blacktriangle;\":\"▴\",\"blacktriangledown;\":\"▾\",\"blacktriangleleft;\":\"◂\",\"blacktriangleright;\":\"▸\",\"blank;\":\"␣\",\"blk12;\":\"▒\",\"blk14;\":\"░\",\"blk34;\":\"▓\",\"block;\":\"█\",\"bne;\":\"=⃥\",\"bnequiv;\":\"≡⃥\",\"bNot;\":\"⫭\",\"bnot;\":\"⌐\",\"Bopf;\":\"𝔹\",\"bopf;\":\"𝕓\",\"bot;\":\"⊥\",\"bottom;\":\"⊥\",\"bowtie;\":\"⋈\",\"boxbox;\":\"⧉\",\"boxDL;\":\"╗\",\"boxDl;\":\"╖\",\"boxdL;\":\"╕\",\"boxdl;\":\"┐\",\"boxDR;\":\"╔\",\"boxDr;\":\"╓\",\"boxdR;\":\"╒\",\"boxdr;\":\"┌\",\"boxH;\":\"═\",\"boxh;\":\"─\",\"boxHD;\":\"╦\",\"boxHd;\":\"╤\",\"boxhD;\":\"╥\",\"boxhd;\":\"┬\",\"boxHU;\":\"╩\",\"boxHu;\":\"╧\",\"boxhU;\":\"╨\",\"boxhu;\":\"┴\",\"boxminus;\":\"⊟\",\"boxplus;\":\"⊞\",\"boxtimes;\":\"⊠\",\"boxUL;\":\"╝\",\"boxUl;\":\"╜\",\"boxuL;\":\"╛\",\"boxul;\":\"┘\",\"boxUR;\":\"╚\",\"boxUr;\":\"╙\",\"boxuR;\":\"╘\",\"boxur;\":\"└\",\"boxV;\":\"║\",\"boxv;\":\"│\",\"boxVH;\":\"╬\",\"boxVh;\":\"╫\",\"boxvH;\":\"╪\",\"boxvh;\":\"┼\",\"boxVL;\":\"╣\",\"boxVl;\":\"╢\",\"boxvL;\":\"╡\",\"boxvl;\":\"┤\",\"boxVR;\":\"╠\",\"boxVr;\":\"╟\",\"boxvR;\":\"╞\",\"boxvr;\":\"├\",\"bprime;\":\"‵\",\"Breve;\":\"˘\",\"breve;\":\"˘\",\"brvbar\":\"¦\",\"brvbar;\":\"¦\",\"Bscr;\":\"ℬ\",\"bscr;\":\"𝒷\",\"bsemi;\":\"⁏\",\"bsim;\":\"∽\",\"bsime;\":\"⋍\",\"bsol;\":\"\\\\\",\"bsolb;\":\"⧅\",\"bsolhsub;\":\"⟈\",\"bull;\":\"•\",\"bullet;\":\"•\",\"bump;\":\"≎\",\"bumpE;\":\"⪮\",\"bumpe;\":\"≏\",\"Bumpeq;\":\"≎\",\"bumpeq;\":\"≏\",\"Cacute;\":\"Ć\",\"cacute;\":\"ć\",\"Cap;\":\"⋒\",\"cap;\":\"∩\",\"capand;\":\"⩄\",\"capbrcup;\":\"⩉\",\"capcap;\":\"⩋\",\"capcup;\":\"⩇\",\"capdot;\":\"⩀\",\"CapitalDifferentialD;\":\"ⅅ\",\"caps;\":\"∩︀\",\"caret;\":\"⁁\",\"caron;\":\"ˇ\",\"Cayleys;\":\"ℭ\",\"ccaps;\":\"⩍\",\"Ccaron;\":\"Č\",\"ccaron;\":\"č\",\"Ccedil\":\"Ç\",\"ccedil\":\"ç\",\"Ccedil;\":\"Ç\",\"ccedil;\":\"ç\",\"Ccirc;\":\"Ĉ\",\"ccirc;\":\"ĉ\",\"Cconint;\":\"∰\",\"ccups;\":\"⩌\",\"ccupssm;\":\"⩐\",\"Cdot;\":\"Ċ\",\"cdot;\":\"ċ\",\"cedil\":\"¸\",\"cedil;\":\"¸\",\"Cedilla;\":\"¸\",\"cemptyv;\":\"⦲\",\"cent\":\"¢\",\"cent;\":\"¢\",\"CenterDot;\":\"·\",\"centerdot;\":\"·\",\"Cfr;\":\"ℭ\",\"cfr;\":\"𝔠\",\"CHcy;\":\"Ч\",\"chcy;\":\"ч\",\"check;\":\"✓\",\"checkmark;\":\"✓\",\"Chi;\":\"Χ\",\"chi;\":\"χ\",\"cir;\":\"○\",\"circ;\":\"ˆ\",\"circeq;\":\"≗\",\"circlearrowleft;\":\"↺\",\"circlearrowright;\":\"↻\",\"circledast;\":\"⊛\",\"circledcirc;\":\"⊚\",\"circleddash;\":\"⊝\",\"CircleDot;\":\"⊙\",\"circledR;\":\"®\",\"circledS;\":\"Ⓢ\",\"CircleMinus;\":\"⊖\",\"CirclePlus;\":\"⊕\",\"CircleTimes;\":\"⊗\",\"cirE;\":\"⧃\",\"cire;\":\"≗\",\"cirfnint;\":\"⨐\",\"cirmid;\":\"⫯\",\"cirscir;\":\"⧂\",\"ClockwiseContourIntegral;\":\"∲\",\"CloseCurlyDoubleQuote;\":\"”\",\"CloseCurlyQuote;\":\"’\",\"clubs;\":\"♣\",\"clubsuit;\":\"♣\",\"Colon;\":\"∷\",\"colon;\":\":\",\"Colone;\":\"⩴\",\"colone;\":\"≔\",\"coloneq;\":\"≔\",\"comma;\":\",\",\"commat;\":\"@\",\"comp;\":\"∁\",\"compfn;\":\"∘\",\"complement;\":\"∁\",\"complexes;\":\"ℂ\",\"cong;\":\"≅\",\"congdot;\":\"⩭\",\"Congruent;\":\"≡\",\"Conint;\":\"∯\",\"conint;\":\"∮\",\"ContourIntegral;\":\"∮\",\"Copf;\":\"ℂ\",\"copf;\":\"𝕔\",\"coprod;\":\"∐\",\"Coproduct;\":\"∐\",\"COPY\":\"©\",\"copy\":\"©\",\"COPY;\":\"©\",\"copy;\":\"©\",\"copysr;\":\"℗\",\"CounterClockwiseContourIntegral;\":\"∳\",\"crarr;\":\"↵\",\"Cross;\":\"⨯\",\"cross;\":\"✗\",\"Cscr;\":\"𝒞\",\"cscr;\":\"𝒸\",\"csub;\":\"⫏\",\"csube;\":\"⫑\",\"csup;\":\"⫐\",\"csupe;\":\"⫒\",\"ctdot;\":\"⋯\",\"cudarrl;\":\"⤸\",\"cudarrr;\":\"⤵\",\"cuepr;\":\"⋞\",\"cuesc;\":\"⋟\",\"cularr;\":\"↶\",\"cularrp;\":\"⤽\",\"Cup;\":\"⋓\",\"cup;\":\"∪\",\"cupbrcap;\":\"⩈\",\"CupCap;\":\"≍\",\"cupcap;\":\"⩆\",\"cupcup;\":\"⩊\",\"cupdot;\":\"⊍\",\"cupor;\":\"⩅\",\"cups;\":\"∪︀\",\"curarr;\":\"↷\",\"curarrm;\":\"⤼\",\"curlyeqprec;\":\"⋞\",\"curlyeqsucc;\":\"⋟\",\"curlyvee;\":\"⋎\",\"curlywedge;\":\"⋏\",\"curren\":\"¤\",\"curren;\":\"¤\",\"curvearrowleft;\":\"↶\",\"curvearrowright;\":\"↷\",\"cuvee;\":\"⋎\",\"cuwed;\":\"⋏\",\"cwconint;\":\"∲\",\"cwint;\":\"∱\",\"cylcty;\":\"⌭\",\"Dagger;\":\"‡\",\"dagger;\":\"†\",\"daleth;\":\"ℸ\",\"Darr;\":\"↡\",\"dArr;\":\"⇓\",\"darr;\":\"↓\",\"dash;\":\"‐\",\"Dashv;\":\"⫤\",\"dashv;\":\"⊣\",\"dbkarow;\":\"⤏\",\"dblac;\":\"˝\",\"Dcaron;\":\"Ď\",\"dcaron;\":\"ď\",\"Dcy;\":\"Д\",\"dcy;\":\"д\",\"DD;\":\"ⅅ\",\"dd;\":\"ⅆ\",\"ddagger;\":\"‡\",\"ddarr;\":\"⇊\",\"DDotrahd;\":\"⤑\",\"ddotseq;\":\"⩷\",\"deg\":\"°\",\"deg;\":\"°\",\"Del;\":\"∇\",\"Delta;\":\"Δ\",\"delta;\":\"δ\",\"demptyv;\":\"⦱\",\"dfisht;\":\"⥿\",\"Dfr;\":\"𝔇\",\"dfr;\":\"𝔡\",\"dHar;\":\"⥥\",\"dharl;\":\"⇃\",\"dharr;\":\"⇂\",\"DiacriticalAcute;\":\"´\",\"DiacriticalDot;\":\"˙\",\"DiacriticalDoubleAcute;\":\"˝\",\"DiacriticalGrave;\":\"`\",\"DiacriticalTilde;\":\"˜\",\"diam;\":\"⋄\",\"Diamond;\":\"⋄\",\"diamond;\":\"⋄\",\"diamondsuit;\":\"♦\",\"diams;\":\"♦\",\"die;\":\"¨\",\"DifferentialD;\":\"ⅆ\",\"digamma;\":\"ϝ\",\"disin;\":\"⋲\",\"div;\":\"÷\",\"divide\":\"÷\",\"divide;\":\"÷\",\"divideontimes;\":\"⋇\",\"divonx;\":\"⋇\",\"DJcy;\":\"Ђ\",\"djcy;\":\"ђ\",\"dlcorn;\":\"⌞\",\"dlcrop;\":\"⌍\",\"dollar;\":\"$\",\"Dopf;\":\"𝔻\",\"dopf;\":\"𝕕\",\"Dot;\":\"¨\",\"dot;\":\"˙\",\"DotDot;\":\"⃜\",\"doteq;\":\"≐\",\"doteqdot;\":\"≑\",\"DotEqual;\":\"≐\",\"dotminus;\":\"∸\",\"dotplus;\":\"∔\",\"dotsquare;\":\"⊡\",\"doublebarwedge;\":\"⌆\",\"DoubleContourIntegral;\":\"∯\",\"DoubleDot;\":\"¨\",\"DoubleDownArrow;\":\"⇓\",\"DoubleLeftArrow;\":\"⇐\",\"DoubleLeftRightArrow;\":\"⇔\",\"DoubleLeftTee;\":\"⫤\",\"DoubleLongLeftArrow;\":\"⟸\",\"DoubleLongLeftRightArrow;\":\"⟺\",\"DoubleLongRightArrow;\":\"⟹\",\"DoubleRightArrow;\":\"⇒\",\"DoubleRightTee;\":\"⊨\",\"DoubleUpArrow;\":\"⇑\",\"DoubleUpDownArrow;\":\"⇕\",\"DoubleVerticalBar;\":\"∥\",\"DownArrow;\":\"↓\",\"Downarrow;\":\"⇓\",\"downarrow;\":\"↓\",\"DownArrowBar;\":\"⤓\",\"DownArrowUpArrow;\":\"⇵\",\"DownBreve;\":\"̑\",\"downdownarrows;\":\"⇊\",\"downharpoonleft;\":\"⇃\",\"downharpoonright;\":\"⇂\",\"DownLeftRightVector;\":\"⥐\",\"DownLeftTeeVector;\":\"⥞\",\"DownLeftVector;\":\"↽\",\"DownLeftVectorBar;\":\"⥖\",\"DownRightTeeVector;\":\"⥟\",\"DownRightVector;\":\"⇁\",\"DownRightVectorBar;\":\"⥗\",\"DownTee;\":\"⊤\",\"DownTeeArrow;\":\"↧\",\"drbkarow;\":\"⤐\",\"drcorn;\":\"⌟\",\"drcrop;\":\"⌌\",\"Dscr;\":\"𝒟\",\"dscr;\":\"𝒹\",\"DScy;\":\"Ѕ\",\"dscy;\":\"ѕ\",\"dsol;\":\"⧶\",\"Dstrok;\":\"Đ\",\"dstrok;\":\"đ\",\"dtdot;\":\"⋱\",\"dtri;\":\"▿\",\"dtrif;\":\"▾\",\"duarr;\":\"⇵\",\"duhar;\":\"⥯\",\"dwangle;\":\"⦦\",\"DZcy;\":\"Џ\",\"dzcy;\":\"џ\",\"dzigrarr;\":\"⟿\",\"Eacute\":\"É\",\"eacute\":\"é\",\"Eacute;\":\"É\",\"eacute;\":\"é\",\"easter;\":\"⩮\",\"Ecaron;\":\"Ě\",\"ecaron;\":\"ě\",\"ecir;\":\"≖\",\"Ecirc\":\"Ê\",\"ecirc\":\"ê\",\"Ecirc;\":\"Ê\",\"ecirc;\":\"ê\",\"ecolon;\":\"≕\",\"Ecy;\":\"Э\",\"ecy;\":\"э\",\"eDDot;\":\"⩷\",\"Edot;\":\"Ė\",\"eDot;\":\"≑\",\"edot;\":\"ė\",\"ee;\":\"ⅇ\",\"efDot;\":\"≒\",\"Efr;\":\"𝔈\",\"efr;\":\"𝔢\",\"eg;\":\"⪚\",\"Egrave\":\"È\",\"egrave\":\"è\",\"Egrave;\":\"È\",\"egrave;\":\"è\",\"egs;\":\"⪖\",\"egsdot;\":\"⪘\",\"el;\":\"⪙\",\"Element;\":\"∈\",\"elinters;\":\"⏧\",\"ell;\":\"ℓ\",\"els;\":\"⪕\",\"elsdot;\":\"⪗\",\"Emacr;\":\"Ē\",\"emacr;\":\"ē\",\"empty;\":\"∅\",\"emptyset;\":\"∅\",\"EmptySmallSquare;\":\"◻\",\"emptyv;\":\"∅\",\"EmptyVerySmallSquare;\":\"▫\",\"emsp13;\":\" \",\"emsp14;\":\" \",\"emsp;\":\" \",\"ENG;\":\"Ŋ\",\"eng;\":\"ŋ\",\"ensp;\":\" \",\"Eogon;\":\"Ę\",\"eogon;\":\"ę\",\"Eopf;\":\"𝔼\",\"eopf;\":\"𝕖\",\"epar;\":\"⋕\",\"eparsl;\":\"⧣\",\"eplus;\":\"⩱\",\"epsi;\":\"ε\",\"Epsilon;\":\"Ε\",\"epsilon;\":\"ε\",\"epsiv;\":\"ϵ\",\"eqcirc;\":\"≖\",\"eqcolon;\":\"≕\",\"eqsim;\":\"≂\",\"eqslantgtr;\":\"⪖\",\"eqslantless;\":\"⪕\",\"Equal;\":\"⩵\",\"equals;\":\"=\",\"EqualTilde;\":\"≂\",\"equest;\":\"≟\",\"Equilibrium;\":\"⇌\",\"equiv;\":\"≡\",\"equivDD;\":\"⩸\",\"eqvparsl;\":\"⧥\",\"erarr;\":\"⥱\",\"erDot;\":\"≓\",\"Escr;\":\"ℰ\",\"escr;\":\"ℯ\",\"esdot;\":\"≐\",\"Esim;\":\"⩳\",\"esim;\":\"≂\",\"Eta;\":\"Η\",\"eta;\":\"η\",\"ETH\":\"Ð\",\"eth\":\"ð\",\"ETH;\":\"Ð\",\"eth;\":\"ð\",\"Euml\":\"Ë\",\"euml\":\"ë\",\"Euml;\":\"Ë\",\"euml;\":\"ë\",\"euro;\":\"€\",\"excl;\":\"!\",\"exist;\":\"∃\",\"Exists;\":\"∃\",\"expectation;\":\"ℰ\",\"ExponentialE;\":\"ⅇ\",\"exponentiale;\":\"ⅇ\",\"fallingdotseq;\":\"≒\",\"Fcy;\":\"Ф\",\"fcy;\":\"ф\",\"female;\":\"♀\",\"ffilig;\":\"ﬃ\",\"fflig;\":\"ﬀ\",\"ffllig;\":\"ﬄ\",\"Ffr;\":\"𝔉\",\"ffr;\":\"𝔣\",\"filig;\":\"ﬁ\",\"FilledSmallSquare;\":\"◼\",\"FilledVerySmallSquare;\":\"▪\",\"fjlig;\":\"fj\",\"flat;\":\"♭\",\"fllig;\":\"ﬂ\",\"fltns;\":\"▱\",\"fnof;\":\"ƒ\",\"Fopf;\":\"𝔽\",\"fopf;\":\"𝕗\",\"ForAll;\":\"∀\",\"forall;\":\"∀\",\"fork;\":\"⋔\",\"forkv;\":\"⫙\",\"Fouriertrf;\":\"ℱ\",\"fpartint;\":\"⨍\",\"frac12\":\"½\",\"frac12;\":\"½\",\"frac13;\":\"⅓\",\"frac14\":\"¼\",\"frac14;\":\"¼\",\"frac15;\":\"⅕\",\"frac16;\":\"⅙\",\"frac18;\":\"⅛\",\"frac23;\":\"⅔\",\"frac25;\":\"⅖\",\"frac34\":\"¾\",\"frac34;\":\"¾\",\"frac35;\":\"⅗\",\"frac38;\":\"⅜\",\"frac45;\":\"⅘\",\"frac56;\":\"⅚\",\"frac58;\":\"⅝\",\"frac78;\":\"⅞\",\"frasl;\":\"⁄\",\"frown;\":\"⌢\",\"Fscr;\":\"ℱ\",\"fscr;\":\"𝒻\",\"gacute;\":\"ǵ\",\"Gamma;\":\"Γ\",\"gamma;\":\"γ\",\"Gammad;\":\"Ϝ\",\"gammad;\":\"ϝ\",\"gap;\":\"⪆\",\"Gbreve;\":\"Ğ\",\"gbreve;\":\"ğ\",\"Gcedil;\":\"Ģ\",\"Gcirc;\":\"Ĝ\",\"gcirc;\":\"ĝ\",\"Gcy;\":\"Г\",\"gcy;\":\"г\",\"Gdot;\":\"Ġ\",\"gdot;\":\"ġ\",\"gE;\":\"≧\",\"ge;\":\"≥\",\"gEl;\":\"⪌\",\"gel;\":\"⋛\",\"geq;\":\"≥\",\"geqq;\":\"≧\",\"geqslant;\":\"⩾\",\"ges;\":\"⩾\",\"gescc;\":\"⪩\",\"gesdot;\":\"⪀\",\"gesdoto;\":\"⪂\",\"gesdotol;\":\"⪄\",\"gesl;\":\"⋛︀\",\"gesles;\":\"⪔\",\"Gfr;\":\"𝔊\",\"gfr;\":\"𝔤\",\"Gg;\":\"⋙\",\"gg;\":\"≫\",\"ggg;\":\"⋙\",\"gimel;\":\"ℷ\",\"GJcy;\":\"Ѓ\",\"gjcy;\":\"ѓ\",\"gl;\":\"≷\",\"gla;\":\"⪥\",\"glE;\":\"⪒\",\"glj;\":\"⪤\",\"gnap;\":\"⪊\",\"gnapprox;\":\"⪊\",\"gnE;\":\"≩\",\"gne;\":\"⪈\",\"gneq;\":\"⪈\",\"gneqq;\":\"≩\",\"gnsim;\":\"⋧\",\"Gopf;\":\"𝔾\",\"gopf;\":\"𝕘\",\"grave;\":\"`\",\"GreaterEqual;\":\"≥\",\"GreaterEqualLess;\":\"⋛\",\"GreaterFullEqual;\":\"≧\",\"GreaterGreater;\":\"⪢\",\"GreaterLess;\":\"≷\",\"GreaterSlantEqual;\":\"⩾\",\"GreaterTilde;\":\"≳\",\"Gscr;\":\"𝒢\",\"gscr;\":\"ℊ\",\"gsim;\":\"≳\",\"gsime;\":\"⪎\",\"gsiml;\":\"⪐\",\"GT\":\">\",\"gt\":\">\",\"GT;\":\">\",\"Gt;\":\"≫\",\"gt;\":\">\",\"gtcc;\":\"⪧\",\"gtcir;\":\"⩺\",\"gtdot;\":\"⋗\",\"gtlPar;\":\"⦕\",\"gtquest;\":\"⩼\",\"gtrapprox;\":\"⪆\",\"gtrarr;\":\"⥸\",\"gtrdot;\":\"⋗\",\"gtreqless;\":\"⋛\",\"gtreqqless;\":\"⪌\",\"gtrless;\":\"≷\",\"gtrsim;\":\"≳\",\"gvertneqq;\":\"≩︀\",\"gvnE;\":\"≩︀\",\"Hacek;\":\"ˇ\",\"hairsp;\":\" \",\"half;\":\"½\",\"hamilt;\":\"ℋ\",\"HARDcy;\":\"Ъ\",\"hardcy;\":\"ъ\",\"hArr;\":\"⇔\",\"harr;\":\"↔\",\"harrcir;\":\"⥈\",\"harrw;\":\"↭\",\"Hat;\":\"^\",\"hbar;\":\"ℏ\",\"Hcirc;\":\"Ĥ\",\"hcirc;\":\"ĥ\",\"hearts;\":\"♥\",\"heartsuit;\":\"♥\",\"hellip;\":\"…\",\"hercon;\":\"⊹\",\"Hfr;\":\"ℌ\",\"hfr;\":\"𝔥\",\"HilbertSpace;\":\"ℋ\",\"hksearow;\":\"⤥\",\"hkswarow;\":\"⤦\",\"hoarr;\":\"⇿\",\"homtht;\":\"∻\",\"hookleftarrow;\":\"↩\",\"hookrightarrow;\":\"↪\",\"Hopf;\":\"ℍ\",\"hopf;\":\"𝕙\",\"horbar;\":\"―\",\"HorizontalLine;\":\"─\",\"Hscr;\":\"ℋ\",\"hscr;\":\"𝒽\",\"hslash;\":\"ℏ\",\"Hstrok;\":\"Ħ\",\"hstrok;\":\"ħ\",\"HumpDownHump;\":\"≎\",\"HumpEqual;\":\"≏\",\"hybull;\":\"⁃\",\"hyphen;\":\"‐\",\"Iacute\":\"Í\",\"iacute\":\"í\",\"Iacute;\":\"Í\",\"iacute;\":\"í\",\"ic;\":\"⁣\",\"Icirc\":\"Î\",\"icirc\":\"î\",\"Icirc;\":\"Î\",\"icirc;\":\"î\",\"Icy;\":\"И\",\"icy;\":\"и\",\"Idot;\":\"İ\",\"IEcy;\":\"Е\",\"iecy;\":\"е\",\"iexcl\":\"¡\",\"iexcl;\":\"¡\",\"iff;\":\"⇔\",\"Ifr;\":\"ℑ\",\"ifr;\":\"𝔦\",\"Igrave\":\"Ì\",\"igrave\":\"ì\",\"Igrave;\":\"Ì\",\"igrave;\":\"ì\",\"ii;\":\"ⅈ\",\"iiiint;\":\"⨌\",\"iiint;\":\"∭\",\"iinfin;\":\"⧜\",\"iiota;\":\"℩\",\"IJlig;\":\"Ĳ\",\"ijlig;\":\"ĳ\",\"Im;\":\"ℑ\",\"Imacr;\":\"Ī\",\"imacr;\":\"ī\",\"image;\":\"ℑ\",\"ImaginaryI;\":\"ⅈ\",\"imagline;\":\"ℐ\",\"imagpart;\":\"ℑ\",\"imath;\":\"ı\",\"imof;\":\"⊷\",\"imped;\":\"Ƶ\",\"Implies;\":\"⇒\",\"in;\":\"∈\",\"incare;\":\"℅\",\"infin;\":\"∞\",\"infintie;\":\"⧝\",\"inodot;\":\"ı\",\"Int;\":\"∬\",\"int;\":\"∫\",\"intcal;\":\"⊺\",\"integers;\":\"ℤ\",\"Integral;\":\"∫\",\"intercal;\":\"⊺\",\"Intersection;\":\"⋂\",\"intlarhk;\":\"⨗\",\"intprod;\":\"⨼\",\"InvisibleComma;\":\"⁣\",\"InvisibleTimes;\":\"⁢\",\"IOcy;\":\"Ё\",\"iocy;\":\"ё\",\"Iogon;\":\"Į\",\"iogon;\":\"į\",\"Iopf;\":\"𝕀\",\"iopf;\":\"𝕚\",\"Iota;\":\"Ι\",\"iota;\":\"ι\",\"iprod;\":\"⨼\",\"iquest\":\"¿\",\"iquest;\":\"¿\",\"Iscr;\":\"ℐ\",\"iscr;\":\"𝒾\",\"isin;\":\"∈\",\"isindot;\":\"⋵\",\"isinE;\":\"⋹\",\"isins;\":\"⋴\",\"isinsv;\":\"⋳\",\"isinv;\":\"∈\",\"it;\":\"⁢\",\"Itilde;\":\"Ĩ\",\"itilde;\":\"ĩ\",\"Iukcy;\":\"І\",\"iukcy;\":\"і\",\"Iuml\":\"Ï\",\"iuml\":\"ï\",\"Iuml;\":\"Ï\",\"iuml;\":\"ï\",\"Jcirc;\":\"Ĵ\",\"jcirc;\":\"ĵ\",\"Jcy;\":\"Й\",\"jcy;\":\"й\",\"Jfr;\":\"𝔍\",\"jfr;\":\"𝔧\",\"jmath;\":\"ȷ\",\"Jopf;\":\"𝕁\",\"jopf;\":\"𝕛\",\"Jscr;\":\"𝒥\",\"jscr;\":\"𝒿\",\"Jsercy;\":\"Ј\",\"jsercy;\":\"ј\",\"Jukcy;\":\"Є\",\"jukcy;\":\"є\",\"Kappa;\":\"Κ\",\"kappa;\":\"κ\",\"kappav;\":\"ϰ\",\"Kcedil;\":\"Ķ\",\"kcedil;\":\"ķ\",\"Kcy;\":\"К\",\"kcy;\":\"к\",\"Kfr;\":\"𝔎\",\"kfr;\":\"𝔨\",\"kgreen;\":\"ĸ\",\"KHcy;\":\"Х\",\"khcy;\":\"х\",\"KJcy;\":\"Ќ\",\"kjcy;\":\"ќ\",\"Kopf;\":\"𝕂\",\"kopf;\":\"𝕜\",\"Kscr;\":\"𝒦\",\"kscr;\":\"𝓀\",\"lAarr;\":\"⇚\",\"Lacute;\":\"Ĺ\",\"lacute;\":\"ĺ\",\"laemptyv;\":\"⦴\",\"lagran;\":\"ℒ\",\"Lambda;\":\"Λ\",\"lambda;\":\"λ\",\"Lang;\":\"⟪\",\"lang;\":\"⟨\",\"langd;\":\"⦑\",\"langle;\":\"⟨\",\"lap;\":\"⪅\",\"Laplacetrf;\":\"ℒ\",\"laquo\":\"«\",\"laquo;\":\"«\",\"Larr;\":\"↞\",\"lArr;\":\"⇐\",\"larr;\":\"←\",\"larrb;\":\"⇤\",\"larrbfs;\":\"⤟\",\"larrfs;\":\"⤝\",\"larrhk;\":\"↩\",\"larrlp;\":\"↫\",\"larrpl;\":\"⤹\",\"larrsim;\":\"⥳\",\"larrtl;\":\"↢\",\"lat;\":\"⪫\",\"lAtail;\":\"⤛\",\"latail;\":\"⤙\",\"late;\":\"⪭\",\"lates;\":\"⪭︀\",\"lBarr;\":\"⤎\",\"lbarr;\":\"⤌\",\"lbbrk;\":\"❲\",\"lbrace;\":\"{\",\"lbrack;\":\"[\",\"lbrke;\":\"⦋\",\"lbrksld;\":\"⦏\",\"lbrkslu;\":\"⦍\",\"Lcaron;\":\"Ľ\",\"lcaron;\":\"ľ\",\"Lcedil;\":\"Ļ\",\"lcedil;\":\"ļ\",\"lceil;\":\"⌈\",\"lcub;\":\"{\",\"Lcy;\":\"Л\",\"lcy;\":\"л\",\"ldca;\":\"⤶\",\"ldquo;\":\"“\",\"ldquor;\":\"„\",\"ldrdhar;\":\"⥧\",\"ldrushar;\":\"⥋\",\"ldsh;\":\"↲\",\"lE;\":\"≦\",\"le;\":\"≤\",\"LeftAngleBracket;\":\"⟨\",\"LeftArrow;\":\"←\",\"Leftarrow;\":\"⇐\",\"leftarrow;\":\"←\",\"LeftArrowBar;\":\"⇤\",\"LeftArrowRightArrow;\":\"⇆\",\"leftarrowtail;\":\"↢\",\"LeftCeiling;\":\"⌈\",\"LeftDoubleBracket;\":\"⟦\",\"LeftDownTeeVector;\":\"⥡\",\"LeftDownVector;\":\"⇃\",\"LeftDownVectorBar;\":\"⥙\",\"LeftFloor;\":\"⌊\",\"leftharpoondown;\":\"↽\",\"leftharpoonup;\":\"↼\",\"leftleftarrows;\":\"⇇\",\"LeftRightArrow;\":\"↔\",\"Leftrightarrow;\":\"⇔\",\"leftrightarrow;\":\"↔\",\"leftrightarrows;\":\"⇆\",\"leftrightharpoons;\":\"⇋\",\"leftrightsquigarrow;\":\"↭\",\"LeftRightVector;\":\"⥎\",\"LeftTee;\":\"⊣\",\"LeftTeeArrow;\":\"↤\",\"LeftTeeVector;\":\"⥚\",\"leftthreetimes;\":\"⋋\",\"LeftTriangle;\":\"⊲\",\"LeftTriangleBar;\":\"⧏\",\"LeftTriangleEqual;\":\"⊴\",\"LeftUpDownVector;\":\"⥑\",\"LeftUpTeeVector;\":\"⥠\",\"LeftUpVector;\":\"↿\",\"LeftUpVectorBar;\":\"⥘\",\"LeftVector;\":\"↼\",\"LeftVectorBar;\":\"⥒\",\"lEg;\":\"⪋\",\"leg;\":\"⋚\",\"leq;\":\"≤\",\"leqq;\":\"≦\",\"leqslant;\":\"⩽\",\"les;\":\"⩽\",\"lescc;\":\"⪨\",\"lesdot;\":\"⩿\",\"lesdoto;\":\"⪁\",\"lesdotor;\":\"⪃\",\"lesg;\":\"⋚︀\",\"lesges;\":\"⪓\",\"lessapprox;\":\"⪅\",\"lessdot;\":\"⋖\",\"lesseqgtr;\":\"⋚\",\"lesseqqgtr;\":\"⪋\",\"LessEqualGreater;\":\"⋚\",\"LessFullEqual;\":\"≦\",\"LessGreater;\":\"≶\",\"lessgtr;\":\"≶\",\"LessLess;\":\"⪡\",\"lesssim;\":\"≲\",\"LessSlantEqual;\":\"⩽\",\"LessTilde;\":\"≲\",\"lfisht;\":\"⥼\",\"lfloor;\":\"⌊\",\"Lfr;\":\"𝔏\",\"lfr;\":\"𝔩\",\"lg;\":\"≶\",\"lgE;\":\"⪑\",\"lHar;\":\"⥢\",\"lhard;\":\"↽\",\"lharu;\":\"↼\",\"lharul;\":\"⥪\",\"lhblk;\":\"▄\",\"LJcy;\":\"Љ\",\"ljcy;\":\"љ\",\"Ll;\":\"⋘\",\"ll;\":\"≪\",\"llarr;\":\"⇇\",\"llcorner;\":\"⌞\",\"Lleftarrow;\":\"⇚\",\"llhard;\":\"⥫\",\"lltri;\":\"◺\",\"Lmidot;\":\"Ŀ\",\"lmidot;\":\"ŀ\",\"lmoust;\":\"⎰\",\"lmoustache;\":\"⎰\",\"lnap;\":\"⪉\",\"lnapprox;\":\"⪉\",\"lnE;\":\"≨\",\"lne;\":\"⪇\",\"lneq;\":\"⪇\",\"lneqq;\":\"≨\",\"lnsim;\":\"⋦\",\"loang;\":\"⟬\",\"loarr;\":\"⇽\",\"lobrk;\":\"⟦\",\"LongLeftArrow;\":\"⟵\",\"Longleftarrow;\":\"⟸\",\"longleftarrow;\":\"⟵\",\"LongLeftRightArrow;\":\"⟷\",\"Longleftrightarrow;\":\"⟺\",\"longleftrightarrow;\":\"⟷\",\"longmapsto;\":\"⟼\",\"LongRightArrow;\":\"⟶\",\"Longrightarrow;\":\"⟹\",\"longrightarrow;\":\"⟶\",\"looparrowleft;\":\"↫\",\"looparrowright;\":\"↬\",\"lopar;\":\"⦅\",\"Lopf;\":\"𝕃\",\"lopf;\":\"𝕝\",\"loplus;\":\"⨭\",\"lotimes;\":\"⨴\",\"lowast;\":\"∗\",\"lowbar;\":\"_\",\"LowerLeftArrow;\":\"↙\",\"LowerRightArrow;\":\"↘\",\"loz;\":\"◊\",\"lozenge;\":\"◊\",\"lozf;\":\"⧫\",\"lpar;\":\"(\",\"lparlt;\":\"⦓\",\"lrarr;\":\"⇆\",\"lrcorner;\":\"⌟\",\"lrhar;\":\"⇋\",\"lrhard;\":\"⥭\",\"lrm;\":\"‎\",\"lrtri;\":\"⊿\",\"lsaquo;\":\"‹\",\"Lscr;\":\"ℒ\",\"lscr;\":\"𝓁\",\"Lsh;\":\"↰\",\"lsh;\":\"↰\",\"lsim;\":\"≲\",\"lsime;\":\"⪍\",\"lsimg;\":\"⪏\",\"lsqb;\":\"[\",\"lsquo;\":\"‘\",\"lsquor;\":\"‚\",\"Lstrok;\":\"Ł\",\"lstrok;\":\"ł\",\"LT\":\"<\",\"lt\":\"<\",\"LT;\":\"<\",\"Lt;\":\"≪\",\"lt;\":\"<\",\"ltcc;\":\"⪦\",\"ltcir;\":\"⩹\",\"ltdot;\":\"⋖\",\"lthree;\":\"⋋\",\"ltimes;\":\"⋉\",\"ltlarr;\":\"⥶\",\"ltquest;\":\"⩻\",\"ltri;\":\"◃\",\"ltrie;\":\"⊴\",\"ltrif;\":\"◂\",\"ltrPar;\":\"⦖\",\"lurdshar;\":\"⥊\",\"luruhar;\":\"⥦\",\"lvertneqq;\":\"≨︀\",\"lvnE;\":\"≨︀\",\"macr\":\"¯\",\"macr;\":\"¯\",\"male;\":\"♂\",\"malt;\":\"✠\",\"maltese;\":\"✠\",\"Map;\":\"⤅\",\"map;\":\"↦\",\"mapsto;\":\"↦\",\"mapstodown;\":\"↧\",\"mapstoleft;\":\"↤\",\"mapstoup;\":\"↥\",\"marker;\":\"▮\",\"mcomma;\":\"⨩\",\"Mcy;\":\"М\",\"mcy;\":\"м\",\"mdash;\":\"—\",\"mDDot;\":\"∺\",\"measuredangle;\":\"∡\",\"MediumSpace;\":\" \",\"Mellintrf;\":\"ℳ\",\"Mfr;\":\"𝔐\",\"mfr;\":\"𝔪\",\"mho;\":\"℧\",\"micro\":\"µ\",\"micro;\":\"µ\",\"mid;\":\"∣\",\"midast;\":\"*\",\"midcir;\":\"⫰\",\"middot\":\"·\",\"middot;\":\"·\",\"minus;\":\"−\",\"minusb;\":\"⊟\",\"minusd;\":\"∸\",\"minusdu;\":\"⨪\",\"MinusPlus;\":\"∓\",\"mlcp;\":\"⫛\",\"mldr;\":\"…\",\"mnplus;\":\"∓\",\"models;\":\"⊧\",\"Mopf;\":\"𝕄\",\"mopf;\":\"𝕞\",\"mp;\":\"∓\",\"Mscr;\":\"ℳ\",\"mscr;\":\"𝓂\",\"mstpos;\":\"∾\",\"Mu;\":\"Μ\",\"mu;\":\"μ\",\"multimap;\":\"⊸\",\"mumap;\":\"⊸\",\"nabla;\":\"∇\",\"Nacute;\":\"Ń\",\"nacute;\":\"ń\",\"nang;\":\"∠⃒\",\"nap;\":\"≉\",\"napE;\":\"⩰̸\",\"napid;\":\"≋̸\",\"napos;\":\"ŉ\",\"napprox;\":\"≉\",\"natur;\":\"♮\",\"natural;\":\"♮\",\"naturals;\":\"ℕ\",\"nbsp\":\" \",\"nbsp;\":\" \",\"nbump;\":\"≎̸\",\"nbumpe;\":\"≏̸\",\"ncap;\":\"⩃\",\"Ncaron;\":\"Ň\",\"ncaron;\":\"ň\",\"Ncedil;\":\"Ņ\",\"ncedil;\":\"ņ\",\"ncong;\":\"≇\",\"ncongdot;\":\"⩭̸\",\"ncup;\":\"⩂\",\"Ncy;\":\"Н\",\"ncy;\":\"н\",\"ndash;\":\"–\",\"ne;\":\"≠\",\"nearhk;\":\"⤤\",\"neArr;\":\"⇗\",\"nearr;\":\"↗\",\"nearrow;\":\"↗\",\"nedot;\":\"≐̸\",\"NegativeMediumSpace;\":\"​\",\"NegativeThickSpace;\":\"​\",\"NegativeThinSpace;\":\"​\",\"NegativeVeryThinSpace;\":\"​\",\"nequiv;\":\"≢\",\"nesear;\":\"⤨\",\"nesim;\":\"≂̸\",\"NestedGreaterGreater;\":\"≫\",\"NestedLessLess;\":\"≪\",\"NewLine;\":\"\\n\",\"nexist;\":\"∄\",\"nexists;\":\"∄\",\"Nfr;\":\"𝔑\",\"nfr;\":\"𝔫\",\"ngE;\":\"≧̸\",\"nge;\":\"≱\",\"ngeq;\":\"≱\",\"ngeqq;\":\"≧̸\",\"ngeqslant;\":\"⩾̸\",\"nges;\":\"⩾̸\",\"nGg;\":\"⋙̸\",\"ngsim;\":\"≵\",\"nGt;\":\"≫⃒\",\"ngt;\":\"≯\",\"ngtr;\":\"≯\",\"nGtv;\":\"≫̸\",\"nhArr;\":\"⇎\",\"nharr;\":\"↮\",\"nhpar;\":\"⫲\",\"ni;\":\"∋\",\"nis;\":\"⋼\",\"nisd;\":\"⋺\",\"niv;\":\"∋\",\"NJcy;\":\"Њ\",\"njcy;\":\"њ\",\"nlArr;\":\"⇍\",\"nlarr;\":\"↚\",\"nldr;\":\"‥\",\"nlE;\":\"≦̸\",\"nle;\":\"≰\",\"nLeftarrow;\":\"⇍\",\"nleftarrow;\":\"↚\",\"nLeftrightarrow;\":\"⇎\",\"nleftrightarrow;\":\"↮\",\"nleq;\":\"≰\",\"nleqq;\":\"≦̸\",\"nleqslant;\":\"⩽̸\",\"nles;\":\"⩽̸\",\"nless;\":\"≮\",\"nLl;\":\"⋘̸\",\"nlsim;\":\"≴\",\"nLt;\":\"≪⃒\",\"nlt;\":\"≮\",\"nltri;\":\"⋪\",\"nltrie;\":\"⋬\",\"nLtv;\":\"≪̸\",\"nmid;\":\"∤\",\"NoBreak;\":\"⁠\",\"NonBreakingSpace;\":\" \",\"Nopf;\":\"ℕ\",\"nopf;\":\"𝕟\",\"not\":\"¬\",\"Not;\":\"⫬\",\"not;\":\"¬\",\"NotCongruent;\":\"≢\",\"NotCupCap;\":\"≭\",\"NotDoubleVerticalBar;\":\"∦\",\"NotElement;\":\"∉\",\"NotEqual;\":\"≠\",\"NotEqualTilde;\":\"≂̸\",\"NotExists;\":\"∄\",\"NotGreater;\":\"≯\",\"NotGreaterEqual;\":\"≱\",\"NotGreaterFullEqual;\":\"≧̸\",\"NotGreaterGreater;\":\"≫̸\",\"NotGreaterLess;\":\"≹\",\"NotGreaterSlantEqual;\":\"⩾̸\",\"NotGreaterTilde;\":\"≵\",\"NotHumpDownHump;\":\"≎̸\",\"NotHumpEqual;\":\"≏̸\",\"notin;\":\"∉\",\"notindot;\":\"⋵̸\",\"notinE;\":\"⋹̸\",\"notinva;\":\"∉\",\"notinvb;\":\"⋷\",\"notinvc;\":\"⋶\",\"NotLeftTriangle;\":\"⋪\",\"NotLeftTriangleBar;\":\"⧏̸\",\"NotLeftTriangleEqual;\":\"⋬\",\"NotLess;\":\"≮\",\"NotLessEqual;\":\"≰\",\"NotLessGreater;\":\"≸\",\"NotLessLess;\":\"≪̸\",\"NotLessSlantEqual;\":\"⩽̸\",\"NotLessTilde;\":\"≴\",\"NotNestedGreaterGreater;\":\"⪢̸\",\"NotNestedLessLess;\":\"⪡̸\",\"notni;\":\"∌\",\"notniva;\":\"∌\",\"notnivb;\":\"⋾\",\"notnivc;\":\"⋽\",\"NotPrecedes;\":\"⊀\",\"NotPrecedesEqual;\":\"⪯̸\",\"NotPrecedesSlantEqual;\":\"⋠\",\"NotReverseElement;\":\"∌\",\"NotRightTriangle;\":\"⋫\",\"NotRightTriangleBar;\":\"⧐̸\",\"NotRightTriangleEqual;\":\"⋭\",\"NotSquareSubset;\":\"⊏̸\",\"NotSquareSubsetEqual;\":\"⋢\",\"NotSquareSuperset;\":\"⊐̸\",\"NotSquareSupersetEqual;\":\"⋣\",\"NotSubset;\":\"⊂⃒\",\"NotSubsetEqual;\":\"⊈\",\"NotSucceeds;\":\"⊁\",\"NotSucceedsEqual;\":\"⪰̸\",\"NotSucceedsSlantEqual;\":\"⋡\",\"NotSucceedsTilde;\":\"≿̸\",\"NotSuperset;\":\"⊃⃒\",\"NotSupersetEqual;\":\"⊉\",\"NotTilde;\":\"≁\",\"NotTildeEqual;\":\"≄\",\"NotTildeFullEqual;\":\"≇\",\"NotTildeTilde;\":\"≉\",\"NotVerticalBar;\":\"∤\",\"npar;\":\"∦\",\"nparallel;\":\"∦\",\"nparsl;\":\"⫽⃥\",\"npart;\":\"∂̸\",\"npolint;\":\"⨔\",\"npr;\":\"⊀\",\"nprcue;\":\"⋠\",\"npre;\":\"⪯̸\",\"nprec;\":\"⊀\",\"npreceq;\":\"⪯̸\",\"nrArr;\":\"⇏\",\"nrarr;\":\"↛\",\"nrarrc;\":\"⤳̸\",\"nrarrw;\":\"↝̸\",\"nRightarrow;\":\"⇏\",\"nrightarrow;\":\"↛\",\"nrtri;\":\"⋫\",\"nrtrie;\":\"⋭\",\"nsc;\":\"⊁\",\"nsccue;\":\"⋡\",\"nsce;\":\"⪰̸\",\"Nscr;\":\"𝒩\",\"nscr;\":\"𝓃\",\"nshortmid;\":\"∤\",\"nshortparallel;\":\"∦\",\"nsim;\":\"≁\",\"nsime;\":\"≄\",\"nsimeq;\":\"≄\",\"nsmid;\":\"∤\",\"nspar;\":\"∦\",\"nsqsube;\":\"⋢\",\"nsqsupe;\":\"⋣\",\"nsub;\":\"⊄\",\"nsubE;\":\"⫅̸\",\"nsube;\":\"⊈\",\"nsubset;\":\"⊂⃒\",\"nsubseteq;\":\"⊈\",\"nsubseteqq;\":\"⫅̸\",\"nsucc;\":\"⊁\",\"nsucceq;\":\"⪰̸\",\"nsup;\":\"⊅\",\"nsupE;\":\"⫆̸\",\"nsupe;\":\"⊉\",\"nsupset;\":\"⊃⃒\",\"nsupseteq;\":\"⊉\",\"nsupseteqq;\":\"⫆̸\",\"ntgl;\":\"≹\",\"Ntilde\":\"Ñ\",\"ntilde\":\"ñ\",\"Ntilde;\":\"Ñ\",\"ntilde;\":\"ñ\",\"ntlg;\":\"≸\",\"ntriangleleft;\":\"⋪\",\"ntrianglelefteq;\":\"⋬\",\"ntriangleright;\":\"⋫\",\"ntrianglerighteq;\":\"⋭\",\"Nu;\":\"Ν\",\"nu;\":\"ν\",\"num;\":\"#\",\"numero;\":\"№\",\"numsp;\":\" \",\"nvap;\":\"≍⃒\",\"nVDash;\":\"⊯\",\"nVdash;\":\"⊮\",\"nvDash;\":\"⊭\",\"nvdash;\":\"⊬\",\"nvge;\":\"≥⃒\",\"nvgt;\":\">⃒\",\"nvHarr;\":\"⤄\",\"nvinfin;\":\"⧞\",\"nvlArr;\":\"⤂\",\"nvle;\":\"≤⃒\",\"nvlt;\":\"<⃒\",\"nvltrie;\":\"⊴⃒\",\"nvrArr;\":\"⤃\",\"nvrtrie;\":\"⊵⃒\",\"nvsim;\":\"∼⃒\",\"nwarhk;\":\"⤣\",\"nwArr;\":\"⇖\",\"nwarr;\":\"↖\",\"nwarrow;\":\"↖\",\"nwnear;\":\"⤧\",\"Oacute\":\"Ó\",\"oacute\":\"ó\",\"Oacute;\":\"Ó\",\"oacute;\":\"ó\",\"oast;\":\"⊛\",\"ocir;\":\"⊚\",\"Ocirc\":\"Ô\",\"ocirc\":\"ô\",\"Ocirc;\":\"Ô\",\"ocirc;\":\"ô\",\"Ocy;\":\"О\",\"ocy;\":\"о\",\"odash;\":\"⊝\",\"Odblac;\":\"Ő\",\"odblac;\":\"ő\",\"odiv;\":\"⨸\",\"odot;\":\"⊙\",\"odsold;\":\"⦼\",\"OElig;\":\"Œ\",\"oelig;\":\"œ\",\"ofcir;\":\"⦿\",\"Ofr;\":\"𝔒\",\"ofr;\":\"𝔬\",\"ogon;\":\"˛\",\"Ograve\":\"Ò\",\"ograve\":\"ò\",\"Ograve;\":\"Ò\",\"ograve;\":\"ò\",\"ogt;\":\"⧁\",\"ohbar;\":\"⦵\",\"ohm;\":\"Ω\",\"oint;\":\"∮\",\"olarr;\":\"↺\",\"olcir;\":\"⦾\",\"olcross;\":\"⦻\",\"oline;\":\"‾\",\"olt;\":\"⧀\",\"Omacr;\":\"Ō\",\"omacr;\":\"ō\",\"Omega;\":\"Ω\",\"omega;\":\"ω\",\"Omicron;\":\"Ο\",\"omicron;\":\"ο\",\"omid;\":\"⦶\",\"ominus;\":\"⊖\",\"Oopf;\":\"𝕆\",\"oopf;\":\"𝕠\",\"opar;\":\"⦷\",\"OpenCurlyDoubleQuote;\":\"“\",\"OpenCurlyQuote;\":\"‘\",\"operp;\":\"⦹\",\"oplus;\":\"⊕\",\"Or;\":\"⩔\",\"or;\":\"∨\",\"orarr;\":\"↻\",\"ord;\":\"⩝\",\"order;\":\"ℴ\",\"orderof;\":\"ℴ\",\"ordf\":\"ª\",\"ordf;\":\"ª\",\"ordm\":\"º\",\"ordm;\":\"º\",\"origof;\":\"⊶\",\"oror;\":\"⩖\",\"orslope;\":\"⩗\",\"orv;\":\"⩛\",\"oS;\":\"Ⓢ\",\"Oscr;\":\"𝒪\",\"oscr;\":\"ℴ\",\"Oslash\":\"Ø\",\"oslash\":\"ø\",\"Oslash;\":\"Ø\",\"oslash;\":\"ø\",\"osol;\":\"⊘\",\"Otilde\":\"Õ\",\"otilde\":\"õ\",\"Otilde;\":\"Õ\",\"otilde;\":\"õ\",\"Otimes;\":\"⨷\",\"otimes;\":\"⊗\",\"otimesas;\":\"⨶\",\"Ouml\":\"Ö\",\"ouml\":\"ö\",\"Ouml;\":\"Ö\",\"ouml;\":\"ö\",\"ovbar;\":\"⌽\",\"OverBar;\":\"‾\",\"OverBrace;\":\"⏞\",\"OverBracket;\":\"⎴\",\"OverParenthesis;\":\"⏜\",\"par;\":\"∥\",\"para\":\"¶\",\"para;\":\"¶\",\"parallel;\":\"∥\",\"parsim;\":\"⫳\",\"parsl;\":\"⫽\",\"part;\":\"∂\",\"PartialD;\":\"∂\",\"Pcy;\":\"П\",\"pcy;\":\"п\",\"percnt;\":\"%\",\"period;\":\".\",\"permil;\":\"‰\",\"perp;\":\"⊥\",\"pertenk;\":\"‱\",\"Pfr;\":\"𝔓\",\"pfr;\":\"𝔭\",\"Phi;\":\"Φ\",\"phi;\":\"φ\",\"phiv;\":\"ϕ\",\"phmmat;\":\"ℳ\",\"phone;\":\"☎\",\"Pi;\":\"Π\",\"pi;\":\"π\",\"pitchfork;\":\"⋔\",\"piv;\":\"ϖ\",\"planck;\":\"ℏ\",\"planckh;\":\"ℎ\",\"plankv;\":\"ℏ\",\"plus;\":\"+\",\"plusacir;\":\"⨣\",\"plusb;\":\"⊞\",\"pluscir;\":\"⨢\",\"plusdo;\":\"∔\",\"plusdu;\":\"⨥\",\"pluse;\":\"⩲\",\"PlusMinus;\":\"±\",\"plusmn\":\"±\",\"plusmn;\":\"±\",\"plussim;\":\"⨦\",\"plustwo;\":\"⨧\",\"pm;\":\"±\",\"Poincareplane;\":\"ℌ\",\"pointint;\":\"⨕\",\"Popf;\":\"ℙ\",\"popf;\":\"𝕡\",\"pound\":\"£\",\"pound;\":\"£\",\"Pr;\":\"⪻\",\"pr;\":\"≺\",\"prap;\":\"⪷\",\"prcue;\":\"≼\",\"prE;\":\"⪳\",\"pre;\":\"⪯\",\"prec;\":\"≺\",\"precapprox;\":\"⪷\",\"preccurlyeq;\":\"≼\",\"Precedes;\":\"≺\",\"PrecedesEqual;\":\"⪯\",\"PrecedesSlantEqual;\":\"≼\",\"PrecedesTilde;\":\"≾\",\"preceq;\":\"⪯\",\"precnapprox;\":\"⪹\",\"precneqq;\":\"⪵\",\"precnsim;\":\"⋨\",\"precsim;\":\"≾\",\"Prime;\":\"″\",\"prime;\":\"′\",\"primes;\":\"ℙ\",\"prnap;\":\"⪹\",\"prnE;\":\"⪵\",\"prnsim;\":\"⋨\",\"prod;\":\"∏\",\"Product;\":\"∏\",\"profalar;\":\"⌮\",\"profline;\":\"⌒\",\"profsurf;\":\"⌓\",\"prop;\":\"∝\",\"Proportion;\":\"∷\",\"Proportional;\":\"∝\",\"propto;\":\"∝\",\"prsim;\":\"≾\",\"prurel;\":\"⊰\",\"Pscr;\":\"𝒫\",\"pscr;\":\"𝓅\",\"Psi;\":\"Ψ\",\"psi;\":\"ψ\",\"puncsp;\":\" \",\"Qfr;\":\"𝔔\",\"qfr;\":\"𝔮\",\"qint;\":\"⨌\",\"Qopf;\":\"ℚ\",\"qopf;\":\"𝕢\",\"qprime;\":\"⁗\",\"Qscr;\":\"𝒬\",\"qscr;\":\"𝓆\",\"quaternions;\":\"ℍ\",\"quatint;\":\"⨖\",\"quest;\":\"?\",\"questeq;\":\"≟\",\"QUOT\":\"\\\"\",\"quot\":\"\\\"\",\"QUOT;\":\"\\\"\",\"quot;\":\"\\\"\",\"rAarr;\":\"⇛\",\"race;\":\"∽̱\",\"Racute;\":\"Ŕ\",\"racute;\":\"ŕ\",\"radic;\":\"√\",\"raemptyv;\":\"⦳\",\"Rang;\":\"⟫\",\"rang;\":\"⟩\",\"rangd;\":\"⦒\",\"range;\":\"⦥\",\"rangle;\":\"⟩\",\"raquo\":\"»\",\"raquo;\":\"»\",\"Rarr;\":\"↠\",\"rArr;\":\"⇒\",\"rarr;\":\"→\",\"rarrap;\":\"⥵\",\"rarrb;\":\"⇥\",\"rarrbfs;\":\"⤠\",\"rarrc;\":\"⤳\",\"rarrfs;\":\"⤞\",\"rarrhk;\":\"↪\",\"rarrlp;\":\"↬\",\"rarrpl;\":\"⥅\",\"rarrsim;\":\"⥴\",\"Rarrtl;\":\"⤖\",\"rarrtl;\":\"↣\",\"rarrw;\":\"↝\",\"rAtail;\":\"⤜\",\"ratail;\":\"⤚\",\"ratio;\":\"∶\",\"rationals;\":\"ℚ\",\"RBarr;\":\"⤐\",\"rBarr;\":\"⤏\",\"rbarr;\":\"⤍\",\"rbbrk;\":\"❳\",\"rbrace;\":\"}\",\"rbrack;\":\"]\",\"rbrke;\":\"⦌\",\"rbrksld;\":\"⦎\",\"rbrkslu;\":\"⦐\",\"Rcaron;\":\"Ř\",\"rcaron;\":\"ř\",\"Rcedil;\":\"Ŗ\",\"rcedil;\":\"ŗ\",\"rceil;\":\"⌉\",\"rcub;\":\"}\",\"Rcy;\":\"Р\",\"rcy;\":\"р\",\"rdca;\":\"⤷\",\"rdldhar;\":\"⥩\",\"rdquo;\":\"”\",\"rdquor;\":\"”\",\"rdsh;\":\"↳\",\"Re;\":\"ℜ\",\"real;\":\"ℜ\",\"realine;\":\"ℛ\",\"realpart;\":\"ℜ\",\"reals;\":\"ℝ\",\"rect;\":\"▭\",\"REG\":\"®\",\"reg\":\"®\",\"REG;\":\"®\",\"reg;\":\"®\",\"ReverseElement;\":\"∋\",\"ReverseEquilibrium;\":\"⇋\",\"ReverseUpEquilibrium;\":\"⥯\",\"rfisht;\":\"⥽\",\"rfloor;\":\"⌋\",\"Rfr;\":\"ℜ\",\"rfr;\":\"𝔯\",\"rHar;\":\"⥤\",\"rhard;\":\"⇁\",\"rharu;\":\"⇀\",\"rharul;\":\"⥬\",\"Rho;\":\"Ρ\",\"rho;\":\"ρ\",\"rhov;\":\"ϱ\",\"RightAngleBracket;\":\"⟩\",\"RightArrow;\":\"→\",\"Rightarrow;\":\"⇒\",\"rightarrow;\":\"→\",\"RightArrowBar;\":\"⇥\",\"RightArrowLeftArrow;\":\"⇄\",\"rightarrowtail;\":\"↣\",\"RightCeiling;\":\"⌉\",\"RightDoubleBracket;\":\"⟧\",\"RightDownTeeVector;\":\"⥝\",\"RightDownVector;\":\"⇂\",\"RightDownVectorBar;\":\"⥕\",\"RightFloor;\":\"⌋\",\"rightharpoondown;\":\"⇁\",\"rightharpoonup;\":\"⇀\",\"rightleftarrows;\":\"⇄\",\"rightleftharpoons;\":\"⇌\",\"rightrightarrows;\":\"⇉\",\"rightsquigarrow;\":\"↝\",\"RightTee;\":\"⊢\",\"RightTeeArrow;\":\"↦\",\"RightTeeVector;\":\"⥛\",\"rightthreetimes;\":\"⋌\",\"RightTriangle;\":\"⊳\",\"RightTriangleBar;\":\"⧐\",\"RightTriangleEqual;\":\"⊵\",\"RightUpDownVector;\":\"⥏\",\"RightUpTeeVector;\":\"⥜\",\"RightUpVector;\":\"↾\",\"RightUpVectorBar;\":\"⥔\",\"RightVector;\":\"⇀\",\"RightVectorBar;\":\"⥓\",\"ring;\":\"˚\",\"risingdotseq;\":\"≓\",\"rlarr;\":\"⇄\",\"rlhar;\":\"⇌\",\"rlm;\":\"‏\",\"rmoust;\":\"⎱\",\"rmoustache;\":\"⎱\",\"rnmid;\":\"⫮\",\"roang;\":\"⟭\",\"roarr;\":\"⇾\",\"robrk;\":\"⟧\",\"ropar;\":\"⦆\",\"Ropf;\":\"ℝ\",\"ropf;\":\"𝕣\",\"roplus;\":\"⨮\",\"rotimes;\":\"⨵\",\"RoundImplies;\":\"⥰\",\"rpar;\":\")\",\"rpargt;\":\"⦔\",\"rppolint;\":\"⨒\",\"rrarr;\":\"⇉\",\"Rrightarrow;\":\"⇛\",\"rsaquo;\":\"›\",\"Rscr;\":\"ℛ\",\"rscr;\":\"𝓇\",\"Rsh;\":\"↱\",\"rsh;\":\"↱\",\"rsqb;\":\"]\",\"rsquo;\":\"’\",\"rsquor;\":\"’\",\"rthree;\":\"⋌\",\"rtimes;\":\"⋊\",\"rtri;\":\"▹\",\"rtrie;\":\"⊵\",\"rtrif;\":\"▸\",\"rtriltri;\":\"⧎\",\"RuleDelayed;\":\"⧴\",\"ruluhar;\":\"⥨\",\"rx;\":\"℞\",\"Sacute;\":\"Ś\",\"sacute;\":\"ś\",\"sbquo;\":\"‚\",\"Sc;\":\"⪼\",\"sc;\":\"≻\",\"scap;\":\"⪸\",\"Scaron;\":\"Š\",\"scaron;\":\"š\",\"sccue;\":\"≽\",\"scE;\":\"⪴\",\"sce;\":\"⪰\",\"Scedil;\":\"Ş\",\"scedil;\":\"ş\",\"Scirc;\":\"Ŝ\",\"scirc;\":\"ŝ\",\"scnap;\":\"⪺\",\"scnE;\":\"⪶\",\"scnsim;\":\"⋩\",\"scpolint;\":\"⨓\",\"scsim;\":\"≿\",\"Scy;\":\"С\",\"scy;\":\"с\",\"sdot;\":\"⋅\",\"sdotb;\":\"⊡\",\"sdote;\":\"⩦\",\"searhk;\":\"⤥\",\"seArr;\":\"⇘\",\"searr;\":\"↘\",\"searrow;\":\"↘\",\"sect\":\"§\",\"sect;\":\"§\",\"semi;\":\";\",\"seswar;\":\"⤩\",\"setminus;\":\"∖\",\"setmn;\":\"∖\",\"sext;\":\"✶\",\"Sfr;\":\"𝔖\",\"sfr;\":\"𝔰\",\"sfrown;\":\"⌢\",\"sharp;\":\"♯\",\"SHCHcy;\":\"Щ\",\"shchcy;\":\"щ\",\"SHcy;\":\"Ш\",\"shcy;\":\"ш\",\"ShortDownArrow;\":\"↓\",\"ShortLeftArrow;\":\"←\",\"shortmid;\":\"∣\",\"shortparallel;\":\"∥\",\"ShortRightArrow;\":\"→\",\"ShortUpArrow;\":\"↑\",\"shy\":\"­\",\"shy;\":\"­\",\"Sigma;\":\"Σ\",\"sigma;\":\"σ\",\"sigmaf;\":\"ς\",\"sigmav;\":\"ς\",\"sim;\":\"∼\",\"simdot;\":\"⩪\",\"sime;\":\"≃\",\"simeq;\":\"≃\",\"simg;\":\"⪞\",\"simgE;\":\"⪠\",\"siml;\":\"⪝\",\"simlE;\":\"⪟\",\"simne;\":\"≆\",\"simplus;\":\"⨤\",\"simrarr;\":\"⥲\",\"slarr;\":\"←\",\"SmallCircle;\":\"∘\",\"smallsetminus;\":\"∖\",\"smashp;\":\"⨳\",\"smeparsl;\":\"⧤\",\"smid;\":\"∣\",\"smile;\":\"⌣\",\"smt;\":\"⪪\",\"smte;\":\"⪬\",\"smtes;\":\"⪬︀\",\"SOFTcy;\":\"Ь\",\"softcy;\":\"ь\",\"sol;\":\"/\",\"solb;\":\"⧄\",\"solbar;\":\"⌿\",\"Sopf;\":\"𝕊\",\"sopf;\":\"𝕤\",\"spades;\":\"♠\",\"spadesuit;\":\"♠\",\"spar;\":\"∥\",\"sqcap;\":\"⊓\",\"sqcaps;\":\"⊓︀\",\"sqcup;\":\"⊔\",\"sqcups;\":\"⊔︀\",\"Sqrt;\":\"√\",\"sqsub;\":\"⊏\",\"sqsube;\":\"⊑\",\"sqsubset;\":\"⊏\",\"sqsubseteq;\":\"⊑\",\"sqsup;\":\"⊐\",\"sqsupe;\":\"⊒\",\"sqsupset;\":\"⊐\",\"sqsupseteq;\":\"⊒\",\"squ;\":\"□\",\"Square;\":\"□\",\"square;\":\"□\",\"SquareIntersection;\":\"⊓\",\"SquareSubset;\":\"⊏\",\"SquareSubsetEqual;\":\"⊑\",\"SquareSuperset;\":\"⊐\",\"SquareSupersetEqual;\":\"⊒\",\"SquareUnion;\":\"⊔\",\"squarf;\":\"▪\",\"squf;\":\"▪\",\"srarr;\":\"→\",\"Sscr;\":\"𝒮\",\"sscr;\":\"𝓈\",\"ssetmn;\":\"∖\",\"ssmile;\":\"⌣\",\"sstarf;\":\"⋆\",\"Star;\":\"⋆\",\"star;\":\"☆\",\"starf;\":\"★\",\"straightepsilon;\":\"ϵ\",\"straightphi;\":\"ϕ\",\"strns;\":\"¯\",\"Sub;\":\"⋐\",\"sub;\":\"⊂\",\"subdot;\":\"⪽\",\"subE;\":\"⫅\",\"sube;\":\"⊆\",\"subedot;\":\"⫃\",\"submult;\":\"⫁\",\"subnE;\":\"⫋\",\"subne;\":\"⊊\",\"subplus;\":\"⪿\",\"subrarr;\":\"⥹\",\"Subset;\":\"⋐\",\"subset;\":\"⊂\",\"subseteq;\":\"⊆\",\"subseteqq;\":\"⫅\",\"SubsetEqual;\":\"⊆\",\"subsetneq;\":\"⊊\",\"subsetneqq;\":\"⫋\",\"subsim;\":\"⫇\",\"subsub;\":\"⫕\",\"subsup;\":\"⫓\",\"succ;\":\"≻\",\"succapprox;\":\"⪸\",\"succcurlyeq;\":\"≽\",\"Succeeds;\":\"≻\",\"SucceedsEqual;\":\"⪰\",\"SucceedsSlantEqual;\":\"≽\",\"SucceedsTilde;\":\"≿\",\"succeq;\":\"⪰\",\"succnapprox;\":\"⪺\",\"succneqq;\":\"⪶\",\"succnsim;\":\"⋩\",\"succsim;\":\"≿\",\"SuchThat;\":\"∋\",\"Sum;\":\"∑\",\"sum;\":\"∑\",\"sung;\":\"♪\",\"sup1\":\"¹\",\"sup1;\":\"¹\",\"sup2\":\"²\",\"sup2;\":\"²\",\"sup3\":\"³\",\"sup3;\":\"³\",\"Sup;\":\"⋑\",\"sup;\":\"⊃\",\"supdot;\":\"⪾\",\"supdsub;\":\"⫘\",\"supE;\":\"⫆\",\"supe;\":\"⊇\",\"supedot;\":\"⫄\",\"Superset;\":\"⊃\",\"SupersetEqual;\":\"⊇\",\"suphsol;\":\"⟉\",\"suphsub;\":\"⫗\",\"suplarr;\":\"⥻\",\"supmult;\":\"⫂\",\"supnE;\":\"⫌\",\"supne;\":\"⊋\",\"supplus;\":\"⫀\",\"Supset;\":\"⋑\",\"supset;\":\"⊃\",\"supseteq;\":\"⊇\",\"supseteqq;\":\"⫆\",\"supsetneq;\":\"⊋\",\"supsetneqq;\":\"⫌\",\"supsim;\":\"⫈\",\"supsub;\":\"⫔\",\"supsup;\":\"⫖\",\"swarhk;\":\"⤦\",\"swArr;\":\"⇙\",\"swarr;\":\"↙\",\"swarrow;\":\"↙\",\"swnwar;\":\"⤪\",\"szlig\":\"ß\",\"szlig;\":\"ß\",\"Tab;\":\"\\t\",\"target;\":\"⌖\",\"Tau;\":\"Τ\",\"tau;\":\"τ\",\"tbrk;\":\"⎴\",\"Tcaron;\":\"Ť\",\"tcaron;\":\"ť\",\"Tcedil;\":\"Ţ\",\"tcedil;\":\"ţ\",\"Tcy;\":\"Т\",\"tcy;\":\"т\",\"tdot;\":\"⃛\",\"telrec;\":\"⌕\",\"Tfr;\":\"𝔗\",\"tfr;\":\"𝔱\",\"there4;\":\"∴\",\"Therefore;\":\"∴\",\"therefore;\":\"∴\",\"Theta;\":\"Θ\",\"theta;\":\"θ\",\"thetasym;\":\"ϑ\",\"thetav;\":\"ϑ\",\"thickapprox;\":\"≈\",\"thicksim;\":\"∼\",\"ThickSpace;\":\"  \",\"thinsp;\":\" \",\"ThinSpace;\":\" \",\"thkap;\":\"≈\",\"thksim;\":\"∼\",\"THORN\":\"Þ\",\"thorn\":\"þ\",\"THORN;\":\"Þ\",\"thorn;\":\"þ\",\"Tilde;\":\"∼\",\"tilde;\":\"˜\",\"TildeEqual;\":\"≃\",\"TildeFullEqual;\":\"≅\",\"TildeTilde;\":\"≈\",\"times\":\"×\",\"times;\":\"×\",\"timesb;\":\"⊠\",\"timesbar;\":\"⨱\",\"timesd;\":\"⨰\",\"tint;\":\"∭\",\"toea;\":\"⤨\",\"top;\":\"⊤\",\"topbot;\":\"⌶\",\"topcir;\":\"⫱\",\"Topf;\":\"𝕋\",\"topf;\":\"𝕥\",\"topfork;\":\"⫚\",\"tosa;\":\"⤩\",\"tprime;\":\"‴\",\"TRADE;\":\"™\",\"trade;\":\"™\",\"triangle;\":\"▵\",\"triangledown;\":\"▿\",\"triangleleft;\":\"◃\",\"trianglelefteq;\":\"⊴\",\"triangleq;\":\"≜\",\"triangleright;\":\"▹\",\"trianglerighteq;\":\"⊵\",\"tridot;\":\"◬\",\"trie;\":\"≜\",\"triminus;\":\"⨺\",\"TripleDot;\":\"⃛\",\"triplus;\":\"⨹\",\"trisb;\":\"⧍\",\"tritime;\":\"⨻\",\"trpezium;\":\"⏢\",\"Tscr;\":\"𝒯\",\"tscr;\":\"𝓉\",\"TScy;\":\"Ц\",\"tscy;\":\"ц\",\"TSHcy;\":\"Ћ\",\"tshcy;\":\"ћ\",\"Tstrok;\":\"Ŧ\",\"tstrok;\":\"ŧ\",\"twixt;\":\"≬\",\"twoheadleftarrow;\":\"↞\",\"twoheadrightarrow;\":\"↠\",\"Uacute\":\"Ú\",\"uacute\":\"ú\",\"Uacute;\":\"Ú\",\"uacute;\":\"ú\",\"Uarr;\":\"↟\",\"uArr;\":\"⇑\",\"uarr;\":\"↑\",\"Uarrocir;\":\"⥉\",\"Ubrcy;\":\"Ў\",\"ubrcy;\":\"ў\",\"Ubreve;\":\"Ŭ\",\"ubreve;\":\"ŭ\",\"Ucirc\":\"Û\",\"ucirc\":\"û\",\"Ucirc;\":\"Û\",\"ucirc;\":\"û\",\"Ucy;\":\"У\",\"ucy;\":\"у\",\"udarr;\":\"⇅\",\"Udblac;\":\"Ű\",\"udblac;\":\"ű\",\"udhar;\":\"⥮\",\"ufisht;\":\"⥾\",\"Ufr;\":\"𝔘\",\"ufr;\":\"𝔲\",\"Ugrave\":\"Ù\",\"ugrave\":\"ù\",\"Ugrave;\":\"Ù\",\"ugrave;\":\"ù\",\"uHar;\":\"⥣\",\"uharl;\":\"↿\",\"uharr;\":\"↾\",\"uhblk;\":\"▀\",\"ulcorn;\":\"⌜\",\"ulcorner;\":\"⌜\",\"ulcrop;\":\"⌏\",\"ultri;\":\"◸\",\"Umacr;\":\"Ū\",\"umacr;\":\"ū\",\"uml\":\"¨\",\"uml;\":\"¨\",\"UnderBar;\":\"_\",\"UnderBrace;\":\"⏟\",\"UnderBracket;\":\"⎵\",\"UnderParenthesis;\":\"⏝\",\"Union;\":\"⋃\",\"UnionPlus;\":\"⊎\",\"Uogon;\":\"Ų\",\"uogon;\":\"ų\",\"Uopf;\":\"𝕌\",\"uopf;\":\"𝕦\",\"UpArrow;\":\"↑\",\"Uparrow;\":\"⇑\",\"uparrow;\":\"↑\",\"UpArrowBar;\":\"⤒\",\"UpArrowDownArrow;\":\"⇅\",\"UpDownArrow;\":\"↕\",\"Updownarrow;\":\"⇕\",\"updownarrow;\":\"↕\",\"UpEquilibrium;\":\"⥮\",\"upharpoonleft;\":\"↿\",\"upharpoonright;\":\"↾\",\"uplus;\":\"⊎\",\"UpperLeftArrow;\":\"↖\",\"UpperRightArrow;\":\"↗\",\"Upsi;\":\"ϒ\",\"upsi;\":\"υ\",\"upsih;\":\"ϒ\",\"Upsilon;\":\"Υ\",\"upsilon;\":\"υ\",\"UpTee;\":\"⊥\",\"UpTeeArrow;\":\"↥\",\"upuparrows;\":\"⇈\",\"urcorn;\":\"⌝\",\"urcorner;\":\"⌝\",\"urcrop;\":\"⌎\",\"Uring;\":\"Ů\",\"uring;\":\"ů\",\"urtri;\":\"◹\",\"Uscr;\":\"𝒰\",\"uscr;\":\"𝓊\",\"utdot;\":\"⋰\",\"Utilde;\":\"Ũ\",\"utilde;\":\"ũ\",\"utri;\":\"▵\",\"utrif;\":\"▴\",\"uuarr;\":\"⇈\",\"Uuml\":\"Ü\",\"uuml\":\"ü\",\"Uuml;\":\"Ü\",\"uuml;\":\"ü\",\"uwangle;\":\"⦧\",\"vangrt;\":\"⦜\",\"varepsilon;\":\"ϵ\",\"varkappa;\":\"ϰ\",\"varnothing;\":\"∅\",\"varphi;\":\"ϕ\",\"varpi;\":\"ϖ\",\"varpropto;\":\"∝\",\"vArr;\":\"⇕\",\"varr;\":\"↕\",\"varrho;\":\"ϱ\",\"varsigma;\":\"ς\",\"varsubsetneq;\":\"⊊︀\",\"varsubsetneqq;\":\"⫋︀\",\"varsupsetneq;\":\"⊋︀\",\"varsupsetneqq;\":\"⫌︀\",\"vartheta;\":\"ϑ\",\"vartriangleleft;\":\"⊲\",\"vartriangleright;\":\"⊳\",\"Vbar;\":\"⫫\",\"vBar;\":\"⫨\",\"vBarv;\":\"⫩\",\"Vcy;\":\"В\",\"vcy;\":\"в\",\"VDash;\":\"⊫\",\"Vdash;\":\"⊩\",\"vDash;\":\"⊨\",\"vdash;\":\"⊢\",\"Vdashl;\":\"⫦\",\"Vee;\":\"⋁\",\"vee;\":\"∨\",\"veebar;\":\"⊻\",\"veeeq;\":\"≚\",\"vellip;\":\"⋮\",\"Verbar;\":\"‖\",\"verbar;\":\"|\",\"Vert;\":\"‖\",\"vert;\":\"|\",\"VerticalBar;\":\"∣\",\"VerticalLine;\":\"|\",\"VerticalSeparator;\":\"❘\",\"VerticalTilde;\":\"≀\",\"VeryThinSpace;\":\" \",\"Vfr;\":\"𝔙\",\"vfr;\":\"𝔳\",\"vltri;\":\"⊲\",\"vnsub;\":\"⊂⃒\",\"vnsup;\":\"⊃⃒\",\"Vopf;\":\"𝕍\",\"vopf;\":\"𝕧\",\"vprop;\":\"∝\",\"vrtri;\":\"⊳\",\"Vscr;\":\"𝒱\",\"vscr;\":\"𝓋\",\"vsubnE;\":\"⫋︀\",\"vsubne;\":\"⊊︀\",\"vsupnE;\":\"⫌︀\",\"vsupne;\":\"⊋︀\",\"Vvdash;\":\"⊪\",\"vzigzag;\":\"⦚\",\"Wcirc;\":\"Ŵ\",\"wcirc;\":\"ŵ\",\"wedbar;\":\"⩟\",\"Wedge;\":\"⋀\",\"wedge;\":\"∧\",\"wedgeq;\":\"≙\",\"weierp;\":\"℘\",\"Wfr;\":\"𝔚\",\"wfr;\":\"𝔴\",\"Wopf;\":\"𝕎\",\"wopf;\":\"𝕨\",\"wp;\":\"℘\",\"wr;\":\"≀\",\"wreath;\":\"≀\",\"Wscr;\":\"𝒲\",\"wscr;\":\"𝓌\",\"xcap;\":\"⋂\",\"xcirc;\":\"◯\",\"xcup;\":\"⋃\",\"xdtri;\":\"▽\",\"Xfr;\":\"𝔛\",\"xfr;\":\"𝔵\",\"xhArr;\":\"⟺\",\"xharr;\":\"⟷\",\"Xi;\":\"Ξ\",\"xi;\":\"ξ\",\"xlArr;\":\"⟸\",\"xlarr;\":\"⟵\",\"xmap;\":\"⟼\",\"xnis;\":\"⋻\",\"xodot;\":\"⨀\",\"Xopf;\":\"𝕏\",\"xopf;\":\"𝕩\",\"xoplus;\":\"⨁\",\"xotime;\":\"⨂\",\"xrArr;\":\"⟹\",\"xrarr;\":\"⟶\",\"Xscr;\":\"𝒳\",\"xscr;\":\"𝓍\",\"xsqcup;\":\"⨆\",\"xuplus;\":\"⨄\",\"xutri;\":\"△\",\"xvee;\":\"⋁\",\"xwedge;\":\"⋀\",\"Yacute\":\"Ý\",\"yacute\":\"ý\",\"Yacute;\":\"Ý\",\"yacute;\":\"ý\",\"YAcy;\":\"Я\",\"yacy;\":\"я\",\"Ycirc;\":\"Ŷ\",\"ycirc;\":\"ŷ\",\"Ycy;\":\"Ы\",\"ycy;\":\"ы\",\"yen\":\"¥\",\"yen;\":\"¥\",\"Yfr;\":\"𝔜\",\"yfr;\":\"𝔶\",\"YIcy;\":\"Ї\",\"yicy;\":\"ї\",\"Yopf;\":\"𝕐\",\"yopf;\":\"𝕪\",\"Yscr;\":\"𝒴\",\"yscr;\":\"𝓎\",\"YUcy;\":\"Ю\",\"yucy;\":\"ю\",\"yuml\":\"ÿ\",\"Yuml;\":\"Ÿ\",\"yuml;\":\"ÿ\",\"Zacute;\":\"Ź\",\"zacute;\":\"ź\",\"Zcaron;\":\"Ž\",\"zcaron;\":\"ž\",\"Zcy;\":\"З\",\"zcy;\":\"з\",\"Zdot;\":\"Ż\",\"zdot;\":\"ż\",\"zeetrf;\":\"ℨ\",\"ZeroWidthSpace;\":\"​\",\"Zeta;\":\"Ζ\",\"zeta;\":\"ζ\",\"Zfr;\":\"ℨ\",\"zfr;\":\"𝔷\",\"ZHcy;\":\"Ж\",\"zhcy;\":\"ж\",\"zigrarr;\":\"⇝\",\"Zopf;\":\"ℤ\",\"zopf;\":\"𝕫\",\"Zscr;\":\"𝒵\",\"zscr;\":\"𝓏\",\"zwj;\":\"‍\",\"zwnj;\":\"‌\"}")
+        Return NamedValues.Value(name)
+    End Function
+    Public Shared Function Numeric(number As Integer) As String
+        If NumericValues = Nil Then NumericValues = Json.Parse("{\"0\":\"�\",\"13\":\"\\r\",\"128\":\"\",\"129\":\"\",\"130\":\"\",\"131\":\"\",\"132\":\"\",\"133\":\"\",\"134\":\"\",\"135\":\"\",\"136\":\"\",\"137\":\"\",\"138\":\"\",\"139\":\"\",\"140\":\"\",\"141\":\"\",\"142\":\"\",\"143\":\"\",\"144\":\"\",\"145\":\"\",\"146\":\"\",\"147\":\"\",\"148\":\"\",\"149\":\"\",\"150\":\"\",\"151\":\"\",\"152\":\"\",\"153\":\"\",\"154\":\"\",\"155\":\"\",\"156\":\"\",\"157\":\"\",\"158\":\"\",\"159\":\"\",\"1\":\"\",\"2\":\"\",\"3\":\"\",\"4\":\"\",\"5\":\"\",\"6\":\"\",\"7\":\"\",\"8\":\"\",\"11\":\"\",\"14\":\"\",\"15\":\"\",\"16\":\"\",\"17\":\"\",\"18\":\"\",\"19\":\"\",\"20\":\"\",\"21\":\"\",\"22\":\"\",\"23\":\"\",\"24\":\"\",\"25\":\"\",\"26\":\"\",\"27\":\"\",\"28\":\"\",\"29\":\"\",\"30\":\"\",\"31\":\"\",\"458750\":\"\",\"1114111\":\"\",\"327679\":\"\",\"851967\":\"\",\"65534\":\"\",\"393214\":\"\",\"655358\":\"\",\"327678\":\"\",\"589822\":\"\",\"524287\":\"\",\"131071\":\"\",\"655359\":\"\",\"393215\":\"\",\"917503\":\"\",\"127\":\"\",\"196607\":\"\",\"720895\":\"\",\"458751\":\"\",\"983039\":\"\",\"196606\":\"\",\"262142\":\"\",\"524286\":\"\",\"64976\":\"\",\"64977\":\"\",\"64978\":\"\",\"64979\":\"\",\"64980\":\"\",\"64981\":\"\",\"64982\":\"\",\"64983\":\"\",\"64984\":\"\",\"64985\":\"\",\"64986\":\"\",\"64987\":\"\",\"64988\":\"\",\"64989\":\"\",\"64990\":\"\",\"64991\":\"\",\"64992\":\"\",\"64993\":\"\",\"64994\":\"\",\"64995\":\"\",\"64996\":\"\",\"64997\":\"\",\"64998\":\"\",\"262143\":\"\",\"786431\":\"\",\"1048575\":\"\",\"64999\":\"\",\"65000\":\"\",\"65001\":\"\",\"65002\":\"\",\"65003\":\"\",\"65004\":\"\",\"65005\":\"\",\"65006\":\"\",\"65007\":\"\",\"786430\":\"\",\"720894\":\"\",\"851966\":\"\",\"917502\":\"\",\"983038\":\"\",\"589823\":\"\",\"1048574\":\"\",\"131070\":\"\",\"1114110\":\"\",\"65535\":\"\"}")
+        If NumericValues.HasKey(Str(number)) Then Return NumericValues.Value(Str(number)).AsString().Value
+        Return String.Chr(number)
+    End Function
+End Class
+
+Function Unescape(inputText As String) As String
+    If Not String.Contains(inputText, "&", True) Then Return inputText
+    Dim output As String = ""
+    Dim cursor As Integer = 0
+    For Each found As RegexMatch In RX("&(#(?:[0-9]+|[xX][0-9a-fA-F]+);?|[^\t\n\f <&#;]{1,32};?)").FindAll(inputText)
+        output += String.SubstringBytes(inputText, cursor, found.StartOffset - cursor)
+        Dim name As String = found.Group(1).Value
+        Dim replacement As String = "&" + name
+        If String.StartsWith(name, "#", True) Then
+            Dim digits As String = Replace(String.Substring(name, 1), ";$", "")
+            Dim radix As Integer = 10
+            If String.StartsWith(String.LCase(digits), "x", True) Then
+                radix = 16
+                digits = String.Substring(digits, 1)
+            End If
+            Dim number As Integer = 0
+            For j As Integer = 0 To String.Len(digits) - 1
+                Dim ch As String = String.LCase(String.Substring(digits, j, 1))
+                Dim n As Integer = String.Asc(ch) - 48
+                If n > 9 Then n = String.Asc(ch) - 87
+                number = number * radix + n
+                If number > 1114111 Then Exit For
+            Next
+            If number > 1114111 Or (number >= 55296 And number <= 57343) Then
+                replacement = "�"
+            Else
+                replacement = HTMLEntities.Numeric(number)
+            End If
+        Else
+            Dim value As JSONItem = HTMLEntities.Named(name)
+            If value.IsString() Then
+                replacement = value.AsString().Value
+            Else
+                For length As Integer = String.Len(name) - 1 To 2 Step -1
+                    value = HTMLEntities.Named(String.Substring(name, 0, length))
+                    If value.IsString() Then
+                        replacement = value.AsString().Value + String.Substring(name, length)
+                        Exit For
+                    End If
+                Next
+            End If
+        End If
+        output += replacement
+        cursor = found.EndOffset
+    Next
+    Return output + String.SubstringBytes(inputText, cursor)
+End Function
+
+Function Quote(inputText As String, slash As Boolean = False) As String
+    Dim data As Bytes = Bytes.FromString(inputText, Text.Encodings.UTF8)
+    Dim output As String = ""
+    Dim hex As String = "0123456789ABCDEF"
+    For i As Integer = 0 To data.Count - 1
+        Dim n As Integer = data.Item(i)
+        If (n >= 65 And n <= 90) Or (n >= 97 And n <= 122) Or (n >= 48 And n <= 57) Or n = 45 Or n = 46 Or n = 95 Or n = 126 Or (slash And n = 47) Then
+            output += String.Chr(n)
+        Else
+            output += "%" + String.Substring(hex, n \ 16, 1) + String.Substring(hex, n Mod 16, 1)
+        End If
+    Next
+    Return output
+End Function
+
+Function Decode(inputText As String) As String
+    Dim data As Bytes = Bytes.FromString(inputText, Text.Encodings.UTF8)
+    Dim output As New Bytes
+    Dim i As Integer = 0
+    While i < data.Count
+        If data.Item(i) = 37 And i + 2 < data.Count Then
+            Dim pair As String = String.Chr(data.Item(i + 1)) + String.Chr(data.Item(i + 2))
+            Dim decoded As Result Of Bytes, String = Bytes.FromHex(pair)
+            If decoded.IsOk Then
+                output.Append(decoded.Value)
+                i += 3
+                Continue While
+            End If
+        End If
+        output.Append(data.Item(i))
+        i += 1
+    End While
+    Return output.ToString(Text.Encodings.UTF8)
+End Function
+
+Function Slug(inputText As String) As String
+    Return Replace(String.Trim(Replace(String.LCase(inputText), "[^\w\s-]", "")), "\s+", "-")
+End Function
+
+Sub Diagnostic(diagnostics As JSONItem, message As String, filename As String = "", page As String = "", target As String = "", hasTarget As Boolean = False)
+    Dim value As JSONItem = JSONItem.NewObject()
+    If filename <> "" Then value.Value("path") = filename
+    If page <> "" Then value.Value("page") = page
+    value.Value("message") = message
+    If hasTarget Then value.Value("target") = target
+    diagnostics.Add(value)
+End Sub
+
+Function AbsoluteLexical(filename As String) As String
+    Dim absoluteName As String = filename
+    If Not String.StartsWith(absoluteName, "/", True) And Not Match(absoluteName, "^[A-Za-z]:") Then absoluteName = Path.Join(DevCwd(), absoluteName)
+    Dim parts As Array Of String = []
+    For Each part As String In String.Split(absoluteName, "/")
+        If part = "" Or part = "." Then Continue For
+        If part = ".." Then
+            If parts.Count > 0 Then Array.RemoveAt(parts, parts.Count - 1)
+        Else
+            Array.Append(parts, part)
+        End If
+    Next
+    absoluteName = String.Join(parts, "/")
+    If Not Match(absoluteName, "^[A-Za-z]:") Then absoluteName = "/" + absoluteName
+    Return absoluteName
+End Function
+
+Function NoLinks(filename As String) As String
+    Dim current As New FileSystemItem(AbsoluteLexical(filename))
+    Dim absolute As String = current.FullPath()
+    While current <> Nil
+        DevNeed(Not DevIsLink(current.FullPath()), "filesystem symlink forbidden: " + current.FullPath())
+        current = current.Parent
+    End While
+    Return absolute
+End Function
+
+Function ReadBytes(filename As String, maximum As Integer, message As String) As Bytes
+    Dim file As New FileSystemItem(filename)
+    Dim opened As Result Of BinaryStream, IOError = BinaryStream.Open(file, False)
+    If opened.IsErr Then Throw New IOException("Cannot read " + filename)
+    Dim stream As BinaryStream = opened.Value
+    Try
+        DevNeed(stream.Length <= maximum, message)
+        Return stream.Read(maximum + 1)
+    Finally
+        stream.Close()
+    End Try
+End Function
+
+Function Lines(source As String) As Array Of String
+    Dim fields As Array Of String = DevLines(source)
+    Dim output As Array Of String = []
+    Dim last As Integer = fields.Count - 1
+    If last >= 0 Then
+        If fields(last) = "" Then last -= 1
+    End If
+    For i As Integer = 0 To last
+        Array.Append(output, fields(i))
+    Next
+    Return output
+End Function
+
+Function Metadata(source As String) As JSONItem
+    Dim output As JSONItem = JSONItem.NewObject()
+    Dim meta As JSONItem = JSONItem.NewObject()
+    output.Value("meta") = meta
+    output.Value("body") = source
+    Dim lines As Array Of String = Lines(source)
+    If lines.Count = 0 Or lines(0) <> "---" Then Return output
+    Dim ending As Integer = -1
+    For i As Integer = 1 To lines.Count - 1
+        If lines(i) = "---" Then
+            ending = i
+            Exit For
+        End If
+    Next
+    DevNeed(ending >= 0, "unterminated front matter")
+    DevNeed(ending <= 128, "front matter exceeds 128 lines")
+    For i As Integer = 1 To ending - 1
+        If String.Trim(lines(i)) = "" Then Continue For
+        Dim found As Optional Of RegexMatch = RX("^([a-z]+):[ ]*(.*)$").Find(lines(i))
+        DevNeed(found.HasValue, "unsupported front matter syntax")
+        Dim key As String = found.Value.Group(1).Value
+        Dim raw As String = found.Value.Group(2).Value
+        DevNeed(DevHas(["title", "summary", "keywords", "symbols", "category", "order", "types", "related", "dependencies"], key), "unknown front matter key: " + key)
+        DevNeed(Not meta.HasKey(key), "duplicate front matter key: " + key)
+        Dim value As JSONItem
+        If key = "order" Then
+            DevNeed(Match(raw, "^-?[0-9]{1,6}$"), "order must be an integer of at most six digits")
+            value = JSONItem.From(Double.Parse(raw).Value)
+        ElseIf DevHas(["keywords", "symbols", "types", "related", "dependencies"], key) Then
+            value = ParseJSON(raw)
+            DevNeed(value.IsArray() And value.Count() <= 64, key + " must be a JSON array of strings (max 64)")
+            For j As Integer = 0 To value.Count() - 1
+                Dim member As JSONItem = value.ValueAt(j)
+                Dim inputText As String = member.AsString().Or("")
+                DevNeed(member.IsString() And String.Len(inputText) > 0 And String.Len(inputText) <= 256 And Not Match(inputText, "[\x00-\x1f]"), "invalid " + key)
+                If key = "dependencies" Then DevNeed(Match(inputText, "^[a-z][a-z0-9_]{0,63}$"), "invalid dependency name")
+                If key = "types" Then DevNeed(Match(inputText, "^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*$"), "invalid type name")
+            Next
+        Else
+            If String.StartsWith(raw, "\"", True) Then
+                value = ParseJSON(raw)
+            Else
+                DevNeed(raw <> "" And Not Match(raw, "[:#\[\]{}&*!|>'\"]") And raw = String.Trim(raw), "unsupported plain scalar; use a JSON quoted string")
+                value = JSONItem.From(raw)
+            End If
+            Dim inputText As String = value.AsString().Or("")
+            DevNeed(value.IsString() And String.Len(inputText) > 0 And String.Len(inputText) <= 2048 And Not Match(inputText, "[\x00-\x1f]"), "invalid scalar: " + key)
+        End If
+        meta.Value(key) = value
+    Next
+    Dim body As Array Of String = []
+    For i As Integer = ending + 1 To lines.Count - 1
+        Array.Append(body, lines(i))
+    Next
+    output.Value("body") = String.Join(body, "\n")
+    Return output
+End Function
+
+Function LocalTarget(href As String, relative As String) As Array Of String
+    Dim decoded As String = Decode(Unescape(href))
+    DevNeed(Not Match(decoded, "[\x00-\x1f\\\\]"), "unsafe link")
+    DevNeed(Not Match(decoded, "^[A-Za-z][A-Za-z0-9+.-]*:") And Not String.StartsWith(decoded, "/", True), "nonlocal link")
+    Dim pieces As Array Of String = String.Split(decoded, "#")
+    Dim fragment As String = ""
+    If pieces.Count > 1 Then fragment = String.Substring(decoded, String.Len(pieces(0)) + 1)
+    Dim target As String = pieces(0)
+    ' A query delimiter before the fragment is allowed only for an empty query.
+    ' Question marks inside the fragment are part of the anchor.
+    Dim queryParts As Array Of String = String.Split(target, "?")
+    If queryParts.Count > 1 Then
+        DevNeed(queryParts.Count = 2 And queryParts(1) = "", "nonlocal link")
+        target = queryParts(0)
+    End If
+    If target = "" Then Return [relative, fragment]
+    Dim relativeParts As Array Of String = String.Split(relative, "/")
+    Dim parts As Array Of String = []
+    For partIndex As Integer = 0 To relativeParts.Count - 2
+        Array.Append(parts, relativeParts(partIndex))
+    Next
+    For Each piece As String In String.Split(target, "/")
+        If piece = ".." Then
+            DevNeed(parts.Count > 0, "link escapes documentation root")
+            Array.RemoveAt(parts, parts.Count - 1)
+        ElseIf piece <> "" And piece <> "." Then
+            Array.Append(parts, piece)
+        End If
+    Next
+    target = String.Join(parts, "/")
+    If target = "" Then target = "."
+    Return [target, fragment]
+End Function
+
+Class Renderer
+    Public Property Relative As String
+    Public Property Paths As JSONItem
+    Public Property Assets As JSONItem
+    Public Property Diagnostics As JSONItem
+    Public Property Embedded As Integer = 0
+
+    Public Function Link(label As String, href As String, image As Boolean) As String
+        Try
+            Dim decoded As String = Decode(Unescape(href))
+            DevNeed(Not Match(decoded, "[\x00-\x1f\\\\]"), "unsafe link")
+            If Not image And Match(decoded, "(?i)^https?:") Then
+                DevNeed(Match(decoded, "(?i)^https?://[^/?#@]+") And Not Match(decoded, "(?i)^https?://[^/?#]*@"), "invalid external reference")
+                Return "<a href=\"" + Escape(href) + "\">" + Escape(label) + "</a>"
+            End If
+            Dim target As Array Of String = LocalTarget(href, Relative)
+            If image Then
+                DevNeed(target(1) = "" And Assets.HasKey(target(0)), "unsupported or missing local image")
+                Dim asset As String = S(Assets, target(0))
+                Embedded += String.Len(asset)
+                DevNeed(Embedded <= 16 * MiB, "page image budget exceeds 16 MiB")
+                Return "<img src=\"" + asset + "\" alt=\"" + Escape(label) + "\">"
+            End If
+            DevNeed(Paths.HasKey(target(0)), "missing local page")
+            Dim url As String = S(Paths, target(0))
+            If target(1) <> "" Then url += "#" + Quote(target(1))
+            Return "<a href=\"" + Escape(url) + "\">" + Escape(label) + "</a>"
+        Catch e As Exception
+            Diagnostic(Diagnostics, e.Message, "", Relative, String.Substring(href, 0, 2048), True)
+            If image Then Return Escape("[Image: " + label + "]")
+            Return Escape(label)
+        End Try
+    End Function
+
+    Public Function Inline(inputText As String) As String
+        Dim output As String = ""
+        Dim cursor As Integer = 0
+        For Each found As RegexMatch In RX("(!?)\[([^\]\n]*)\]\(([^\s()]*)\)|`([^`\n]+)`|\*\*([^*\n]+)\*\*|\*([^*\n]+)\*").FindAll(inputText)
+            output += Escape(String.SubstringBytes(inputText, cursor, found.StartOffset - cursor))
+            If found.Group(2).HasValue Then
+                output += Me.Link(found.Group(2).Value, found.Group(3).Value, found.Group(1).Value <> "")
+            ElseIf found.Group(4).HasValue Then
+                output += "<code>" + Escape(found.Group(4).Value) + "</code>"
+            ElseIf found.Group(5).HasValue Then
+                output += "<strong>" + Escape(found.Group(5).Value) + "</strong>"
+            Else
+                output += "<em>" + Escape(found.Group(6).Value) + "</em>"
+            End If
+            cursor = found.EndOffset
+        Next
+        Return output + Escape(String.SubstringBytes(inputText, cursor))
+    End Function
+
+    Public Function TableCells(line As String, tag As String) As String
+        Dim body As String = String.Trim(line)
+        body = Replace(body, "^\|+|\|+$", "")
+        Dim output As String = ""
+        For Each cell As String In String.Split(body, "|")
+            output += "<" + tag + ">" + Me.Inline(String.Trim(cell)) + "</" + tag + ">"
+        Next
+        Return output
+    End Function
+
+    Public Function Render(source As String) As String
+        Dim lines As Array Of String = Lines(source)
+        Dim output As Array Of String = []
+        Dim headings As JSONItem = JSONItem.NewObject()
+        Dim tablePattern As String = "^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$"
+        Dim i As Integer = 0
+        While i < lines.Count
+            Dim line As String = lines(i)
+            Dim fence As Optional Of RegexMatch = RX("^\s*(`{3,}|~{3,})([A-Za-z0-9_+.-]*)\s*$").Find(line)
+            If fence.HasValue Then
+                Dim marker As String = fence.Value.Group(1).Value
+                Dim language As String = fence.Value.Group(2).Value
+                Dim body As Array Of String = []
+                i += 1
+                While i < lines.Count
+                    If Match(lines(i), "^\s*" + String.Substring(marker, 0, 1) + "{" + Str(String.Len(marker)) + ",}\s*$") Then Exit While
+                    Array.Append(body, lines(i))
+                    i += 1
+                End While
+                Dim attribute As String = ""
+                If language <> "" Then attribute = " class=\"language-" + language + "\""
+                Dim code As String = String.Join(body, "\n")
+                If body.Count > 0 Then code += "\n"
+                Array.Append(output, "<pre><code" + attribute + ">" + Escape(code) + "</code></pre>")
+            ElseIf Match(line, "^#{1,6} ") Then
+                Dim found As RegexMatch = RX("^(#{1,6}) (.*)$").Find(line).Value
+                Dim title As String = found.Group(2).Value
+                Dim base As String = Slug(title)
+                Dim count As Integer = headings.Value(base).AsNumber().Or(0.0)
+                headings.Value(base) = count + 1
+                Dim ident As String = base
+                If count > 0 Then ident += "-" + Str(count)
+                Dim level As String = Str(String.Len(found.Group(1).Value))
+                Array.Append(output, "<h" + level + " id=\"" + Escape(ident) + "\">" + Me.Inline(title) + "</h" + level + ">")
+            ElseIf i + 1 < lines.Count And String.Contains(line, "|", True) And Match(lines(i + 1), tablePattern) Then
+                Array.Append(output, "<table><thead><tr>" + Me.TableCells(line, "th") + "</tr></thead><tbody>")
+                i += 2
+                While i < lines.Count
+                    If Not String.Contains(lines(i), "|", True) Or String.Trim(lines(i)) = "" Then Exit While
+                    Array.Append(output, "<tr>" + Me.TableCells(lines(i), "td") + "</tr>")
+                    i += 1
+                End While
+                Array.Append(output, "</tbody></table>")
+                i -= 1
+            ElseIf Match(line, "^\s*(?:[-+*]|[0-9]+\.) ") Then
+                Dim tag As String = "ul"
+                Dim expression As String = "^\s*[-+*] (.*)"
+                If Match(line, "^\s*[0-9]+\.") Then
+                    tag = "ol"
+                    expression = "^\s*[0-9]+\. (.*)"
+                End If
+                Array.Append(output, "<" + tag + ">")
+                While i < lines.Count
+                    Dim item As Optional Of RegexMatch = RX(expression).Find(lines(i))
+                    If Not item.HasValue Then Exit While
+                    Array.Append(output, "<li>" + Me.Inline(item.Value.Group(1).Value) + "</li>")
+                    i += 1
+                End While
+                Array.Append(output, "</" + tag + ">")
+                i -= 1
+            ElseIf Match(line, "^\s*(?:-{3,}|\*{3,}|_{3,})\s*$") Then
+                Array.Append(output, "<hr>")
+            ElseIf String.StartsWith(line, "> ", True) Then
+                Dim body As Array Of String = []
+                While i < lines.Count
+                    If Not String.StartsWith(lines(i), "> ", True) Then Exit While
+                    Array.Append(body, String.Substring(lines(i), 2))
+                    i += 1
+                End While
+                Array.Append(output, "<blockquote><p>" + Me.Inline(String.Join(body, " ")) + "</p></blockquote>")
+                i -= 1
+            ElseIf String.Trim(line) <> "" Then
+                Dim body As Array Of String = []
+                Array.Append(body, String.Trim(line))
+                i += 1
+                While i < lines.Count
+                    Dim candidate As String = lines(i)
+                    If String.Trim(candidate) = "" Then Exit While
+                    If Match(candidate, "^\s*(?:#{1,6} |`{3,}|~{3,}|[-+*] |[0-9]+\. |> )") Or Match(candidate, "^\s*(?:-{3,}|\*{3,}|_{3,})\s*$") Then Exit While
+                    If i + 1 < lines.Count And String.Contains(candidate, "|", True) And Match(lines(i + 1), tablePattern) Then Exit While
+                    Array.Append(body, String.Trim(candidate))
+                    i += 1
+                End While
+                Array.Append(output, "<p>" + Me.Inline(String.Join(body, " ")) + "</p>")
+                i -= 1
+            End If
+            i += 1
+        End While
+        Return String.Join(output, "\n")
+    End Function
+End Class
+
+Function LE(data As Bytes, offset As Integer, size As Integer) As Integer
+    DevNeed(offset >= 0 And offset + size <= data.Count, "Truncated central directory")
+    If size = 8 Then DevNeed(data.Item(offset + 7) < 128, "archive value exceeds supported range")
+    Dim value As Integer = 0
+    Dim factor As Integer = 1
+    For i As Integer = 0 To size - 1
+        value += data.Item(offset + i) * factor
+        factor *= 256
+    Next
+    Return value
+End Function
+
+Sub ValidateArchive(data As Bytes)
+    Dim ending As Integer = -1
+    For i As Integer = data.Count - 22 To Math.Max(0, data.Count - 65557) Step -1
+        If LE(data, i, 4) = 101010256 Then
+            ending = i
+            Exit For
+        End If
+    Next
+    DevNeed(ending >= 0, "File is not a zip file")
+    Dim count As Integer = LE(data, ending + 10, 2)
+    Dim offset As Integer = LE(data, ending + 16, 4)
+    If count = 65535 Or offset = 4294967295 Then
+        DevNeed(ending >= 20 And LE(data, ending - 20, 4) = 117853008, "Bad zip64 locator")
+        Dim zip64Offset As Integer = LE(data, ending - 12, 8)
+        DevNeed(LE(data, zip64Offset, 4) = 101075792, "Bad zip64 directory")
+        count = LE(data, zip64Offset + 32, 8)
+        offset = LE(data, zip64Offset + 48, 8)
+    End If
+    DevNeed(count <= 16384, "too many archive entries")
+    Dim seen As JSONItem = JSONItem.NewObject()
+    For i As Integer = 0 To count - 1
+        DevNeed(LE(data, offset, 4) = 33639248, "Bad magic number for central directory")
+        Dim nameLength As Integer = LE(data, offset + 28, 2)
+        Dim extraLength As Integer = LE(data, offset + 30, 2)
+        Dim commentLength As Integer = LE(data, offset + 32, 2)
+        Dim entryFlagsValue As Integer = LE(data, offset + 8, 2)
+        Dim nameBytes As New Bytes
+        For j As Integer = 0 To nameLength - 1
+            nameBytes.Append(data.Item(offset + 46 + j))
+        Next
+        For byteIndex As Integer = 0 To nameBytes.Count - 1
+            DevNeed(nameBytes.Item(byteIndex) >= 32, "unsafe archive path")
+        Next
+        Dim name As String = ""
+        If (entryFlagsValue And 2048) <> 0 Then
+            name = nameBytes.ToString(Text.Encodings.UTF8)
+        Else
+            Dim cp437 As String = "ÇüéâäàåçêëèïîìÄÅÉæÆôöòûùÿÖÜ¢£¥₧ƒáíóúñÑªº¿⌐¬½¼¡«»░▒▓│┤╡╢╖╕╣║╗╝╜╛┐└┴┬├─┼╞╟╚╔╩╦╠═╬╧╨╤╥╙╘╒╓╫╪┘┌█▄▌▐▀αßΓπΣσµτΦΘΩδ∞φε∩≡±≥≤⌠⌡÷≈°∙·√ⁿ²■ "
+            Dim characters As Array Of String = []
+            For byteIndex As Integer = 0 To nameBytes.Count - 1
+                Dim number As Integer = nameBytes.Item(byteIndex)
+                If number < 128 Then
+                    Array.Append(characters, String.Chr(number))
+                Else
+                    Array.Append(characters, String.Substring(cp437, number - 128, 1))
+                End If
+            Next
+            name = String.Join(characters, "")
+        End If
+        DevNeed(name <> "" And Not String.StartsWith(name, "/", True) And Not Match(name, "[\\\\:\x00-\x1f]"), "unsafe archive path")
+        Dim cleaned As String = Replace(name, "/+$", "")
+        For Each part As String In String.Split(cleaned, "/")
+            DevNeed(part <> "" And part <> "." And part <> "..", "unsafe archive path")
+        Next
+        Dim folded As String = String.LCase(name)
+        DevNeed(Not seen.HasKey(folded), "duplicate archive path")
+        seen.Value(folded) = True
+        Dim mode As Integer = (LE(data, offset + 38, 4) \ 65536) And 61440
+        DevNeed(mode = 0 Or mode = 32768 Or mode = 16384, "archive special file or symlink forbidden")
+        offset += 46 + nameLength + extraLength + commentLength
+    Next
+End Sub
+
+Function EntryBytes(reader As ZipReader, name As String, maximum As Integer) As Bytes
+    DevNeed(reader.LocateEntry(name, False), "There is no item named '" + name + "' in the archive")
+    Dim entry As ZipEntry = reader.CurrentEntry
+    Dim compressedSize As Integer = entry.CompressedSize
+    If compressedSize < 1 Then compressedSize = 1
+    DevNeed(entry.UncompressedSize <= maximum And entry.UncompressedSize <= compressedSize * 200, "entry size/compression limit: " + name)
+    DevNeed((entry.Flag And EntryFlags.Encrypted) <> EntryFlags.Encrypted, "encrypted entry forbidden")
+    Dim extracted As Optional Of Bytes = reader.ExtractCurrentEntryToBytes()
+    DevNeed(extracted.HasValue, "cannot extract archive entry: " + name)
+    DevNeed(extracted.Value.Count <= maximum, "entry exceeds size limit")
+    Return extracted.Value
+End Function
+
+Function ImageURI(name As String, data As Bytes) As String
+    Dim lower As String = String.LCase(name)
+    Dim hex As String = data.ToHex()
+    Dim mime As String = ""
+    If String.EndsWith(lower, ".png", True) And String.StartsWith(hex, "89504e470d0a1a0a", True) Then mime = "image/png"
+    If Match(lower, "\.jpe?g$") And String.StartsWith(hex, "ffd8ff", True) Then mime = "image/jpeg"
+    If String.EndsWith(lower, ".gif", True) And Match(hex, "^474946383[79]61") Then mime = "image/gif"
+    If String.EndsWith(lower, ".webp", True) And Match(hex, "^52494646........57454250") Then mime = "image/webp"
+    DevNeed(mime <> "", "unsupported image type or signature: " + name)
+    Return "data:" + mime + ";base64," + data.ToBase64()
+End Function
+
+Function VersionOK(version As String) As Boolean
+    Return String.Len(version) <= 128 And Match(version, "^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$")
+End Function
+
+Function Crumb(title As String, url As String) As JSONItem
+    Dim value As JSONItem = JSONItem.NewObject()
+    value.Value("title") = title
+    value.Value("path") = url
+    Return value
+End Function
+
+Function ReadPackage(filename As String, claimed As JSONItem, diagnostics As JSONItem, expectedName As String = "") As JSONItem
+    filename = NoLinks(filename)
+    Dim data As Bytes = ReadBytes(filename, 256 * MiB, "archive exceeds 256 MiB")
+    ValidateArchive(data)
+    Dim opened As Result Of ZipReader, ZipError = ZipReader.Open(filename)
+    DevNeed(opened.IsOk, "File is not a zip file")
+    Dim reader As ZipReader = opened.Value
+    Dim outcome As JSONItem = JSONItem.NewObject()
+    Dim pages As JSONItem = JSONItem.NewArray()
+    outcome.Value("pages") = pages
+    Try
+        Dim manifest As JSONItem = ParseJSON(EntryBytes(reader, "manifest.json", MiB).ToString(Text.Encodings.UTF8), True)
+        DevNeed(manifest.IsObject() And manifest.Value("schema").IsNumber() And manifest.Value("schema").AsNumber().Or(0.0) = 1.0, "invalid manifest schema")
+        Dim name As String = S(manifest, "name")
+        Dim version As String = S(manifest, "version")
+        DevNeed(Match(name, "^[a-z][a-z0-9_]{0,63}$"), "invalid package name")
+        If expectedName <> "" And name <> expectedName Then
+            claimed.Value(expectedName) = True
+            Throw New InvalidArgumentException("Locked archive manifest identity mismatch")
+        End If
+        If claimed.HasKey(name) Then Return outcome
+        claimed.Value(name) = True
+        DevNeed(VersionOK(version), "invalid package version")
+        Dim versionParts As Array Of String = String.Split(version, "+")
+        If versionParts.Count > 1 Then
+            For Each ident As String In String.Split(versionParts(1), ".")
+                DevNeed(ident <> "", "empty version build identifier")
+            Next
+        End If
+        Dim prerelease As Optional Of RegexMatch = RX("^[^-]+-(.*)$").Find(versionParts(0))
+        If prerelease.HasValue Then
+            For Each ident As String In String.Split(prerelease.Value.Group(1).Value, ".")
+                DevNeed(ident <> "" And Not Match(ident, "^0[0-9]+$"), "invalid prerelease identifier")
+            Next
+        End If
+        Dim entries As Array Of String = []
+        Dim total As Integer = 0
+        If reader.GotoFirstEntry() Then
+            Do
+                Dim entry As ZipEntry = reader.CurrentEntry
+                If String.StartsWith(entry.Name, DocsPrefix, True) And Not entry.IsDirectory Then
+                    total += entry.UncompressedSize
+                    Array.Append(entries, entry.Name)
+                End If
+                If Not reader.GotoNextEntry() Then Exit Do
+            Loop
+        End If
+        DevNeed(total <= 16 * MiB, "package documentation exceeds 16 MiB")
+        Array.Sort(entries)
+        Dim documents As JSONItem = JSONItem.NewObject()
+        Dim assets As JSONItem = JSONItem.NewObject()
+        Dim paths As JSONItem = JSONItem.NewObject()
+        Dim prefix As String = "/package/" + name + "/" + Quote(version) + "/"
+        For Each entryName As String In entries
+            Dim relative As String = String.Substring(entryName, String.Len(DocsPrefix))
+            Try
+                If String.EndsWith(relative, ".md", True) Then
+                    Dim body As String = EntryBytes(reader, entryName, MiB).ToString(Text.Encodings.UTF8)
+                    body = Replace(body, "^\x{FEFF}", "")
+                    documents.Value(relative) = Metadata(body)
+                    paths.Value(relative) = prefix + Quote(relative, True)
+                ElseIf Match(String.LCase(relative), "\.(png|jpg|jpeg|gif|webp)$") Then
+                    assets.Value(relative) = ImageURI(relative, EntryBytes(reader, entryName, 4 * MiB))
+                End If
+            Catch e As Exception
+                Diagnostic(diagnostics, e.Message, filename, relative)
+            End Try
+        Next
+        Dim names As Array Of String = documents.Keys()
+        ' Stable insertion sort by metadata order, then lexical relative path.
+        For i As Integer = 1 To names.Count - 1
+            Dim j As Integer = i
+            While j > 0
+                Dim before As Double = documents.Value(names(j - 1)).Value("meta").Value("order").AsNumber().Or(0.0)
+                Dim after As Double = documents.Value(names(j)).Value("meta").Value("order").AsNumber().Or(0.0)
+                If before < after Or (before = after And String.Compare(names(j - 1), names(j), True) <= 0) Then Exit While
+                Dim swap As String = names(j - 1)
+                names(j - 1) = names(j)
+                names(j) = swap
+                j -= 1
+            End While
+        Next
+        Dim renderedBytes As Integer = 0
+        Dim byRelative As JSONItem = JSONItem.NewObject()
+        Dim dependencies As JSONItem = JSONItem.NewObject()
+        For Each relative As String In names
+            Dim doc As JSONItem = documents.Value(relative)
+            Dim meta As JSONItem = doc.Value("meta")
+            Dim body As String = S(doc, "body")
+            Dim renderer As New Renderer
+            renderer.Relative = relative
+            renderer.Paths = paths
+            renderer.Assets = assets
+            renderer.Diagnostics = diagnostics
+            Dim rendered As String = renderer.Render(body)
+            renderedBytes += Bytes.FromString(rendered, Text.Encodings.UTF8).Count
+            DevNeed(renderedBytes <= 32 * MiB, "rendered package documentation exceeds 32 MiB")
+            Dim title As String = Replace(relative, "^.*/", "")
+            title = Replace(title, "\.[^.]*$", "")
+            Dim heading As Optional Of RegexMatch = RX("(?m)^# (.+)$").Find(body)
+            If heading.HasValue Then title = String.Trim(heading.Value.Group(1).Value)
+            title = S(meta, "title", title)
+            If meta.HasKey("types") Then
+                Dim validTypes As JSONItem = JSONItem.NewArray()
+                For Each datatype As String In DevStrings(meta.Value("types"))
+                    If String.Contains(rendered, "id=\"" + Slug(datatype) + "\"", True) Then
+                        validTypes.Add(datatype)
+                    Else
+                        Diagnostic(diagnostics, "missing type anchor", "", relative, datatype, True)
+                    End If
+                Next
+                meta.Value("types") = validTypes
+            End If
+            Dim page As JSONItem = JSONItem.NewObject()
+            page.Value("path") = S(paths, relative)
+            page.Value("title") = title
+            page.Value("section") = "packages"
+            page.Value("relative") = relative
+            page.Value("source") = "file://" + Quote(filename, True) + "!/" + Quote(DocsPrefix + relative, True)
+            page.Value("html") = rendered
+            page.Value("text") = String.Trim(Replace(Unescape(Replace(rendered, "<[^>]*>", " ")), "\s+", " "))
+            page.Value("sourceId") = "package:" + name
+            page.Value("sourceName") = name
+            page.Value("package") = name
+            page.Value("version") = version
+            For Each key As String In meta.Keys()
+                If key <> "title" Then page.Value(key) = meta.Value(key)
+            Next
+            If meta.HasKey("dependencies") Then
+                For Each dependency As String In DevStrings(meta.Value("dependencies"))
+                    dependencies.Value(dependency) = True
+                Next
+            End If
+            pages.Add(page)
+            byRelative.Value(relative) = page
+        Next
+        Dim dependencyNames As Array Of String = dependencies.Keys()
+        Array.Sort(dependencyNames)
+        For i As Integer = 0 To pages.Count() - 1
+            Dim page As JSONItem = pages.ValueAt(i)
+            Dim relative As String = S(page, "relative")
+            If dependencyNames.Count > 0 Then page.Value("dependencies") = DevArray(dependencyNames)
+            If page.HasKey("related") Then
+                Dim related As Array Of String = []
+                For Each href As String In DevStrings(page.Value("related"))
+                    Try
+                        Dim target As Array Of String = LocalTarget(href, relative)
+                        DevNeed(paths.HasKey(target(0)), "missing related topic")
+                        Dim url As String = S(paths, target(0))
+                        If target(1) <> "" Then url += "#" + Quote(target(1))
+                        If url <> S(page, "path") And Not DevHas(related, url) Then Array.Append(related, url)
+                    Catch e As Exception
+                        Diagnostic(diagnostics, e.Message, "", relative, href, True)
+                    End Try
+                Next
+                page.Value("related") = DevArray(related)
+            End If
+            Dim root As JSONItem = byRelative.Value("index.md")
+            Dim crumbs As JSONItem = JSONItem.NewArray()
+            crumbs.Add(Crumb(S(root, "title", name), S(root, "path")))
+            Dim parts As Array Of String = String.Split(relative, "/")
+            Dim parentRelative As String = ""
+            For j As Integer = 0 To parts.Count - 2
+                parentRelative += parts(j) + "/"
+                Dim parent As JSONItem = byRelative.Value(parentRelative + "index.md")
+                crumbs.Add(Crumb(S(parent, "title", parts(j)), S(parent, "path")))
+            Next
+            If S(crumbs.ValueAt(crumbs.Count() - 1), "path") <> S(page, "path") Then crumbs.Add(Crumb(S(page, "title"), S(page, "path")))
+            page.Value("breadcrumbs") = crumbs
+        Next
+        Dim source As JSONItem = JSONItem.NewObject()
+        source.Value("id") = "package:" + name
+        source.Value("name") = name
+        source.Value("kind") = "package"
+        source.Value("package") = name
+        source.Value("version") = version
+        source.Value("origin") = filename
+        source.Value("pageCount") = pages.Count()
+        outcome.Value("source") = source
+        Return outcome
+    Finally
+        reader.Close()
+    End Try
+End Function
+
+Class DefinitionIndexer
+    Public Property Used As JSONItem = JSONItem.NewObject()
+    Public Property Definitions As JSONItem = JSONItem.NewArray()
+    Public Property Owner As String
+    Public Property Declared As Array Of String = []
+
+    Public Function Anchor(element As String, name As String, kind As String) As String
+        Dim firstTag As RegexMatch = RX("(?s)^<[^>\"']*(?:(?:\"[^\"]*\"|'[^']*')[^>\"']*)*>").Find(element).Value
+        Dim idMatch As Optional Of RegexMatch = RX("(?i)\bid\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s>]+))").Find(firstTag.Value)
+        Dim ident As String = ""
+        If idMatch.HasValue Then
+            ident = Unescape(idMatch.Value.Group(1).Or(idMatch.Value.Group(2).Or(idMatch.Value.Group(3).Or(""))))
+        Else
+            Dim base As String = "definition-" + Slug(name)
+            ident = base
+            Dim n As Integer = 2
+            While Used.HasKey(ident)
+                ident = base + "-" + Str(n)
+                n += 1
+            End While
+            Used.Value(ident) = True
+            element = String.SubstringBytes(element, 0, firstTag.EndOffset - 1) + " id=\"" + Escape(ident) + "\"" + String.SubstringBytes(element, firstTag.EndOffset - 1)
+        End If
+        Dim found As Boolean = False
+        For i As Integer = 0 To Definitions.Count() - 1
+            Dim d As JSONItem = Definitions.ValueAt(i)
+            If S(d, "name") = name And S(d, "anchor") = ident And S(d, "kind") = kind Then found = True
+        Next
+        If Not found Then
+            Dim definition As JSONItem = JSONItem.NewObject()
+            definition.Value("name") = name
+            definition.Value("anchor") = ident
+            definition.Value("kind") = kind
+            Definitions.Add(definition)
+        End If
+        Return element
+    End Function
+
+    Public Function Qualified(name As String) As String
+        If String.Contains(name, ".", True) Or Owner = "" Then Return name
+        Return Owner + "." + name
+    End Function
+
+    Public Sub Register(element As JSONItem, name As String, kind As String, edits As JSONItem)
+        Dim opening As String = S(element, "opening")
+        Dim updated As String = Me.Anchor(opening, name, kind)
+        If updated <> opening Then
+            Dim edit As JSONItem = JSONItem.NewObject()
+            edit.Value("offset") = element.Value("end")
+            edit.Value("value") = String.SubstringBytes(updated, Bytes.FromString(opening, Text.Encodings.UTF8).Count - 1, Bytes.FromString(updated, Text.Encodings.UTF8).Count - Bytes.FromString(opening, Text.Encodings.UTF8).Count)
+            edits.Add(edit)
+            element.Value("opening") = updated
+        End If
+    End Sub
+
+    Public Function Process(source As String) As String
+        Dim heading As JSONItem = JSONItem.Null()
+        Dim table As JSONItem = JSONItem.Null()
+        Dim row As JSONItem = JSONItem.Null()
+        Dim cell As JSONItem = JSONItem.Null()
+        Dim edits As JSONItem = JSONItem.NewArray()
+        For Each found As RegexMatch In RX("(?s)<!--[\s\S]*?-->|<!(?:[^>]*>)|<\?(?:[^>]*>)|</?[A-Za-z][^>\"']*(?:(?:\"[^\"]*\"|'[^']*')[^>\"']*)*>|[^<]+|<").FindAll(source)
+            Dim token As String = found.Value
+            If String.StartsWith(token, "<!--", True) Or String.StartsWith(token, "<!", True) Or String.StartsWith(token, "<?", True) Then Continue For
+            Dim tagMatch As Optional Of RegexMatch = RX("^<(/?)([A-Za-z][A-Za-z0-9:-]*)").Find(token)
+            If Not tagMatch.HasValue Then
+                Dim data As String = Unescape(token)
+                If Not heading.IsNull() Then heading.Value("text") = S(heading, "text") + data
+                If Not cell.IsNull() Then cell.Value("text") = S(cell, "text") + data
+                Continue For
+            End If
+            Dim tag As String = String.LCase(tagMatch.Value.Group(2).Value)
+            If tagMatch.Value.Group(1).Value = "" Then
+                Dim element As JSONItem = JSONItem.NewObject()
+                element.Value("opening") = token
+                element.Value("end") = found.EndOffset - 1
+                element.Value("text") = ""
+                If Match(tag, "^h[1-6]$") Then
+                    heading = element
+                    heading.Value("level") = String.Substring(tag, 1)
+                ElseIf tag = "table" Then
+                    table = JSONItem.NewObject()
+                    table.Value("header") = ""
+                ElseIf tag = "tr" And Not table.IsNull() Then
+                    row = element
+                    row.Value("cells") = JSONItem.NewArray()
+                ElseIf (tag = "td" Or tag = "th") And Not row.IsNull() Then
+                    cell = element
+                    cell.Value("tag") = tag
+                End If
+            Else
+                If Match(tag, "^h[1-6]$") And Not heading.IsNull() Then
+                    Dim label As String = String.Trim(S(heading, "text"))
+                    If S(heading, "level") = "2" Then
+                        If DevHas(Declared, label) Then
+                            Owner = label
+                            Me.Register(heading, label, "type", edits)
+                        ElseIf String.EndsWith(label, " functions", True) Then
+                            Owner = ""
+                        End If
+                    ElseIf S(heading, "level") = "3" Then
+                        Dim member As String = Replace(label, " \(overload [0-9]+\)$", "")
+                        If Match(member, "^[A-Za-z_]\w*(?:\.\w+)*$") And Not DevHas(["properties", "methods", "events", "fields", "values", "constants", "parameters", "returns", "summary", "syntax", "example", "examples", "notes", "unused-boilerplate"], String.LCase(member)) Then Me.Register(heading, Me.Qualified(member), "member", edits)
+                    End If
+                    heading = JSONItem.Null()
+                ElseIf (tag = "th" Or tag = "td") And Not cell.IsNull() Then
+                    If Not row.IsNull() Then row.Value("cells").Add(cell)
+                    cell = JSONItem.Null()
+                ElseIf tag = "tr" And Not row.IsNull() Then
+                    Dim cells As JSONItem = row.Value("cells")
+                    If cells.Count() > 0 Then
+                        Dim first As JSONItem = cells.ValueAt(0)
+                        Dim label As String = String.Trim(S(first, "text"))
+                        If S(first, "tag") = "th" And S(table, "header") = "" Then
+                            table.Value("header") = String.LCase(label)
+                        ElseIf DevHas(["name", "method", "property", "member", "function", "event", "constant", "constructor", "symbol", "call"], S(table, "header")) Then
+                            Dim namespaceName As String = ""
+                            For Each memberMatch As RegexMatch In RX("(?:^|[/,]\s*)([A-Za-z_]\w*(?:\.\w+)*)(?=\s*\(|\s*(?:/|$))").FindAll(label)
+                                Dim member As String = memberMatch.Group(1).Value
+                                If String.Contains(member, ".", True) Then
+                                    namespaceName = Replace(member, "\.[^.]*$", "")
+                                ElseIf namespaceName <> "" Then
+                                    member = namespaceName + "." + member
+                                End If
+                                Me.Register(row, Me.Qualified(member), "member", edits)
+                            Next
+                        End If
+                    End If
+                    row = JSONItem.Null()
+                ElseIf tag = "table" Then
+                    table = JSONItem.Null()
+                End If
+            End If
+        Next
+        For i As Integer = edits.Count() - 1 To 0 Step -1
+            Dim edit As JSONItem = edits.ValueAt(i)
+            Dim offset As Integer = edit.Value("offset").AsNumber().Value
+            source = String.SubstringBytes(source, 0, offset) + S(edit, "value") + String.SubstringBytes(source, offset)
+        Next
+        Return source
+    End Function
+End Class
+
+Sub IndexDefinitions(page As JSONItem)
+    If S(page, "section") <> "reference" And Not (S(page, "section") = "packages" And Match(S(page, "category"), "(?i)^(Reference|API)$")) Then
+        page.Remove("definitions")
+        Return
+    End If
+    Dim indexer As New DefinitionIndexer
+    indexer.Owner = String.Split(String.Split(S(page, "title"), " Of ")(0), " (")(0)
+    If indexer.Owner = "Strings" Then indexer.Owner = "String"
+    If indexer.Owner = "Arrays" Then indexer.Owner = "Array"
+    If Not Match(indexer.Owner, "^[A-Za-z_]\w*$") Then indexer.Owner = ""
+    If page.HasKey("types") Then indexer.Declared = DevStrings(page.Value("types"))
+    Dim source As String = S(page, "html")
+    For Each found As RegexMatch In RX("\bid=[\"']([^\"']+)").FindAll(source)
+        indexer.Used.Value(found.Group(1).Value) = True
+    Next
+    Dim definitions As JSONItem = page.Value("definitions")
+    For i As Integer = 0 To definitions.Count() - 1
+        Dim d As JSONItem = definitions.ValueAt(i)
+        If d.IsObject() And S(d, "kind") = "keyword" And indexer.Used.HasKey(S(d, "anchor")) Then indexer.Definitions.Add(d)
+    Next
+    Dim rendered As String = indexer.Process(source)
+    If indexer.Definitions.Count() > 0 Then
+        page.Value("html") = rendered
+        page.Value("definitions") = indexer.Definitions
+    End If
+End Sub
+
+Function LockedArchives(project As String, diagnostics As JSONItem) As JSONItem
+    Dim filename As String = Path.Join(project, "bpm.lock")
+    Dim file As New FileSystemItem(filename)
+    If Not file.Exists() Then Return JSONItem.NewObject()
+    Try
+        NoLinks(filename)
+        Dim lock As JSONItem = ParseJSON(ReadBytes(filename, 8 * MiB, "BPM lock exceeds 8 MiB").ToString(Text.Encodings.UTF8))
+        DevNeed(lock.IsObject() And lock.Value("schema").AsNumber().Or(0.0) = 1.0, "invalid BPM lock schema")
+        Dim graph As JSONItem = lock.Value("packages")
+        DevNeed(graph.IsObject(), "invalid BPM lock packages")
+        Dim install As JSONItem = lock.Value("install")
+        If Not lock.HasKey("install") Then install = DevArray(graph.Keys())
+        DevNeed(install.IsArray() And install.Count() <= 4096, "invalid BPM install closure")
+        Dim expected As JSONItem = JSONItem.NewObject()
+        For i As Integer = 0 To install.Count() - 1
+            Dim name As String = install.ValueAt(i).AsString().Or("")
+            DevNeed(Match(name, "^[a-z][a-z0-9_]{0,63}$"), "invalid BPM package name")
+            Dim entry As JSONItem = graph.Value(name)
+            DevNeed(entry.IsObject() And S(entry, "name") = name, "invalid BPM package identity")
+            Dim version As String = S(entry, "version")
+            Dim digest As String = S(entry, "sha256")
+            DevNeed(VersionOK(version), "invalid BPM package version")
+            DevNeed(Match(digest, "^[0-9a-fA-F]{64}$"), "invalid BPM archive digest")
+            Dim archive As String = name + "-" + version + ".buipkg"
+            DevNeed(Not expected.HasKey(archive), "duplicate BPM install identity")
+            Dim identity As JSONItem = JSONItem.NewObject()
+            identity.Value("name") = name
+            identity.Value("digest") = String.LCase(digest)
+            expected.Value(archive) = identity
+        Next
+        Return expected
+    Catch e As Exception
+        Diagnostic(diagnostics, e.Message, filename)
+        Return JSONItem.NewObject()
+    End Try
+End Function
+
+Function GlobalDirectory() As String
+    Dim homeDir As String = System.EnvironmentVariable("HOME").Or("")
+    #If TargetMac Then
+        Return Path.Join(homeDir, "Library/Application Support/buoy/packages")
+    #ElseIf TargetWindows Then
+        homeDir = System.EnvironmentVariable("USERPROFILE").Or(homeDir)
+        Return Path.Join(System.EnvironmentVariable("LOCALAPPDATA").Or(Path.Join(homeDir, "AppData/Local")), "buoy/packages")
+    #Else
+        Return Path.Join(System.EnvironmentVariable("XDG_DATA_HOME").Or(Path.Join(homeDir, ".local/share")), "buoy/packages")
+    #End If
+End Function
+
+Function Discover(project As String, snapshot As String, globalDir As String) As JSONItem
+    Dim raw As Bytes = ReadBytes(snapshot, 128 * MiB, "upstream snapshot exceeds 128 MiB")
+    ' Strict parsing preserves duplicate-key rejection before JSONItem loses keys.
+    Dim outcome As JSONItem = ParseJSON(raw.ToString(Text.Encodings.UTF8))
+    DevNeed(outcome.IsObject() And outcome.Value("pages").IsArray(), "invalid upstream snapshot")
+    Dim pages As JSONItem = JSONItem.NewArray()
+    Dim inputPages As JSONItem = outcome.Value("pages")
+    For i As Integer = 0 To inputPages.Count() - 1
+        Dim page As JSONItem = inputPages.ValueAt(i)
+        DevNeed(page.IsObject(), "invalid upstream page")
+        For Each key As String In ["path", "title", "section", "relative", "source", "html", "text"]
+            DevNeed(page.Value(key).IsString(), "invalid upstream page")
+        Next
+        If S(page, "package") = "" And Not String.StartsWith(S(page, "path"), "/package/", True) Then pages.Add(page)
+    Next
+    Dim diagnostics As JSONItem = JSONItem.NewArray()
+    Dim claimed As JSONItem = JSONItem.NewObject()
+    Dim expected As JSONItem = LockedArchives(project, diagnostics)
+    Dim localDir As String = Path.Join(project, "packages")
+    For Each filename As String In expected.Keys()
+        Dim file As New FileSystemItem(Path.Join(localDir, filename))
+        If Not file.Exists() Then
+            claimed.Value(S(expected.Value(filename), "name")) = True
+            Diagnostic(diagnostics, "Locked package is not installed; run bpm sync", Path.Join(localDir, filename))
+        End If
+    Next
+    Dim sources As JSONItem = JSONItem.NewArray()
+    Dim upstream As JSONItem = JSONItem.NewObject()
+    upstream.Value("id") = "upstream"
+    upstream.Value("name") = "Buoy"
+    upstream.Value("kind") = "upstream"
+    upstream.Value("origin") = outcome.Value("source")
+    If Not outcome.HasKey("source") Then upstream.Value("origin") = snapshot
+    upstream.Value("pageCount") = pages.Count()
+    sources.Add(upstream)
+    Dim packageBytes As Integer = 0
+    For Each directoryName As String In [localDir, globalDir]
+        Dim directory As String = directoryName
+        Try
+            directory = NoLinks(directory)
+            Dim folder As New FileSystemItem(directory)
+            If Not folder.Exists() Then Continue For
+            Dim paths As Array Of String = []
+            For Each file As FileSystemItem In folder.Children()
+                If String.EndsWith(file.Name(), ".buipkg", True) Then
+                    Array.Append(paths, file.Name())
+                    DevNeed(paths.Count <= 4096, "too many package archives")
+                End If
+            Next
+            Array.Sort(paths)
+            Dim local As Boolean = directory = DevAbsolute(localDir)
+            Dim ordered As Array Of String = []
+            If local Then
+                For Each filename As String In paths
+                    If expected.HasKey(filename) Then Array.Append(ordered, filename)
+                Next
+            End If
+            For Each filename As String In paths
+                If Not local Or Not expected.HasKey(filename) Then Array.Append(ordered, filename)
+            Next
+            For Each basename As String In ordered
+                Dim filename As String = Path.Join(directory, basename)
+                Dim locked As JSONItem = JSONItem.Null()
+                If local Then locked = expected.Value(basename)
+                Try
+                    If Not locked.IsNull() Then
+                        Try
+                            NoLinks(filename)
+                            Dim archiveBytes As Bytes = ReadBytes(filename, 256 * MiB, "archive exceeds 256 MiB")
+                            Dim digest As String = Crypto.Hash(Crypto.HashAlgorithms.SHA256, archiveBytes).ToHex()
+                            DevNeed(digest = S(locked, "digest"), "Locked package SHA-256 mismatch; run bpm verify")
+                        Catch e As Exception
+                            claimed.Value(S(locked, "name")) = True
+                            Throw e
+                        End Try
+                    End If
+                    Dim additions As JSONItem = ReadPackage(filename, claimed, diagnostics, S(locked, "name"))
+                    Dim newPages As JSONItem = additions.Value("pages")
+                    For i As Integer = 0 To newPages.Count() - 1
+                        packageBytes += Bytes.FromString(Serialize(newPages.ValueAt(i)), Text.Encodings.UTF8).Count
+                    Next
+                    DevNeed(packageBytes <= 64 * MiB, "combined package documentation exceeds 64 MiB")
+                    For i As Integer = 0 To newPages.Count() - 1
+                        pages.Add(newPages.ValueAt(i))
+                    Next
+                    If additions.HasKey("source") Then sources.Add(additions.Value("source"))
+                Catch e As Exception
+                    If Not locked.IsNull() Then claimed.Value(S(locked, "name")) = True
+                    Diagnostic(diagnostics, e.Message, filename)
+                End Try
+            Next
+        Catch e As Exception
+            Diagnostic(diagnostics, e.Message, directory)
+        End Try
+    Next
+    Dim index As JSONItem = JSONItem.NewObject()
+    Dim counts As JSONItem = JSONItem.NewObject()
+    Dim validPaths As JSONItem = JSONItem.NewObject()
+    For i As Integer = 0 To pages.Count() - 1
+        Dim page As JSONItem = pages.ValueAt(i)
+        IndexDefinitions(page)
+        validPaths.Value(S(page, "path")) = True
+        Dim section As String = S(page, "section")
+        counts.Value(section) = counts.Value(section).AsNumber().Or(0.0) + 1
+        Dim searchable As String = S(page, "title") + " " + S(page, "text") + " " + S(page, "summary") + " " + S(page, "category") + " " + S(page, "package")
+        For Each key As String In ["keywords", "symbols"]
+            If page.HasKey(key) Then searchable += " " + String.Join(DevStrings(page.Value(key)), " ")
+        Next
+        Dim definitions As JSONItem = page.Value("definitions")
+        For j As Integer = 0 To definitions.Count() - 1
+            searchable += " " + S(definitions.ValueAt(j), "name")
+        Next
+        Dim tokens As JSONItem = JSONItem.NewObject()
+        For Each token As String In String.Split(Replace(String.LCase(searchable), "\W+", " "), " ")
+            If token <> "" Then tokens.Value(token) = True
+        Next
+        Dim names As Array Of String = tokens.Keys()
+        Array.Sort(names)
+        For Each token As String In names
+            If Not index.HasKey(token) Then index.Value(token) = JSONItem.NewArray()
+            index.Value(token).Add(i)
+        Next
+    Next
+    outcome.Value("pages") = pages
+    outcome.Value("index") = index
+    outcome.Value("counts") = counts
+    outcome.Value("sources") = sources
+    outcome.Value("diagnostics") = diagnostics
+    outcome.Value("captured") = DateTime.Now(TimeZone.Utc).ToIso8601()
+    Dim aliases As JSONItem = JSONItem.NewObject()
+    For Each key As String In outcome.Value("aliases").Keys()
+        Dim destination As String = S(outcome.Value("aliases"), key)
+        If validPaths.HasKey(destination) Then aliases.Value(key) = destination
+    Next
+    outcome.Value("aliases") = aliases
+    If Not outcome.HasKey("missing") Then outcome.Value("missing") = JSONItem.NewArray()
+    If Not validPaths.HasKey(S(outcome, "startPath")) Then
+        outcome.Value("startPath") = S(pages.ValueAt(0), "path")
+    End If
+    Return outcome
+End Function
+
+Private Declare Function SyncOutput Lib "buoy_processkit" Alias "bpk_sync_file" (filename As String) As Integer
+#If TargetWindows Then
+Private Declare Function ReplaceOutput Lib "kernel32" Alias "MoveFileExW" (source As Ptr, destination As Ptr, options As UInt32) As Int32
+#End If
+
+Sub WriteSnapshot(filename As String, content As String)
+    Dim destination As New FileSystemItem(AbsoluteLexical(filename))
+    DevMkdir(destination.ParentPath())
+    Dim temporary As String = DevTemp(".buoy-docs-", destination.ParentPath())
+    Try
+        Dim file As New FileSystemItem(Path.Join(temporary, "snapshot"))
+        Dim written As Result Of Integer, String = file.WriteAllText(content)
+        If written.IsErr Then Throw New IOException(written.Error)
+        DevNeed(SyncOutput(file.FullPath()) <> 0, "cannot synchronize output")
+        #If TargetWindows Then
+            Dim sourceWide As Bytes = Bytes.FromString(file.FullPath(), Text.Encodings.UTF16LE)
+            sourceWide.Append(0)
+            sourceWide.Append(0)
+            Dim destinationWide As Bytes = Bytes.FromString(destination.FullPath(), Text.Encodings.UTF16LE)
+            destinationWide.Append(0)
+            destinationWide.Append(0)
+            DevNeed(ReplaceOutput(sourceWide.DataPtr(), destinationWide.DataPtr(), 9) <> 0, "cannot replace output: " + filename)
+        #Else
+            DevNeed(file.MoveTo(destination), "cannot replace output: " + filename)
+        #End If
+    Finally
+        DevRemoveTree(temporary)
+    End Try
+End Sub
+
+Function Main(args As Array Of String) As Integer
+    Dim options As JSONItem = JSONItem.NewObject()
+    Dim i As Integer = 1
+    While i < args.Count
+        Dim key As String = args(i)
+        If key = "--help" Or key = "-h" Then
+            Print "usage: discover_documentation.bui --project PROJECT --snapshot SNAPSHOT --output OUTPUT [--global-dir GLOBAL_DIR]"
+            Print "Build an offline BuoyDocs snapshot from upstream and installed package data."
+            Return 0
+        End If
+        Dim equal As Optional Of RegexMatch = RX("^(--[^=]+)=(.*)$").Find(key)
+        Dim argument As String = ""
+        If equal.HasValue Then
+            key = equal.Value.Group(1).Value
+            argument = equal.Value.Group(2).Value
+        ElseIf i + 1 < args.Count Then
+            argument = args(i + 1)
+        End If
+        If Not DevHas(["--project", "--snapshot", "--output", "--global-dir"], key) Or (Not equal.HasValue And i + 1 >= args.Count) Then
+            StdErr.WriteLine("discover_documentation: unrecognized or incomplete argument: " + key)
+            Return 2
+        End If
+        options.Value(key) = argument
+        If Not equal.HasValue Then i += 1
+        i += 1
+    End While
+    For Each key As String In ["--project", "--snapshot", "--output"]
+        If Not options.HasKey(key) Then
+            StdErr.WriteLine("discover_documentation: required argument: " + key)
+            Return 2
+        End If
+    Next
+    Try
+        Dim outcome As JSONItem = Discover(S(options, "--project"), S(options, "--snapshot"), S(options, "--global-dir", GlobalDirectory()))
+        Dim serialized As String = Serialize(outcome) + "\n"
+        DevNeed(Bytes.FromString(serialized, Text.Encodings.UTF8).Count <= 128 * MiB, "unified snapshot exceeds 128 MiB")
+        WriteSnapshot(S(options, "--output"), serialized)
+        Dim summary As JSONItem = JSONItem.NewObject()
+        summary.Value("output") = S(options, "--output")
+        summary.Value("pages") = outcome.Value("pages").Count()
+        summary.Value("sources") = outcome.Value("sources").Count()
+        summary.Value("diagnostics") = outcome.Value("diagnostics")
+        Print Json.Stringify(summary)
+        Return 0
+    Catch e As Exception
+        Dim errorValue As JSONItem = JSONItem.NewObject()
+        errorValue.Value("error") = e.Message
+        StdErr.WriteLine(Json.Stringify(errorValue))
+        Return 1
+    End Try
+End Function

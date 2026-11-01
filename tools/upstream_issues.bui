@@ -1,0 +1,284 @@
+' Read-only Linux issue queue inspector. Requires GNU realpath and sha256sum.
+' Publication preparation and submission recording remain in the Python CLI.
+' JSONItem normalizes numeric tokens: exitCode 0.0 cannot be distinguished from 0.
+' Malformed-record diagnostics and argparse error formatting are not byte-identical.
+Import helper_runtime
+
+Private Optional Declare Function QueueOpen Lib "c" Alias "popen" (command As String, mode As String) As Ptr
+Private Optional Declare Function QueueRead Lib "c" Alias "fread" (buffer As Ptr, size As UInt64, count As UInt64, stream As Ptr) As UInt64
+Private Optional Declare Function QueueClose Lib "c" Alias "pclose" (stream As Ptr) As Int32
+
+' Avoid repeated Shell lifecycle crashes observed during full-queue validation.
+Private Function Capture(command As String) As String
+    Dim stream As Ptr = QueueOpen(command, "r")
+    If stream = Nil Then Throw New RuntimeException("cannot start command")
+    Dim data As New Bytes()
+    Dim buffer As New Bytes(4096)
+    Dim count As UInt64 = QueueRead(buffer.DataPtr(), 1, 4096, stream)
+    While count > 0
+        data.Append(buffer.DataPtr(), count)
+        count = QueueRead(buffer.DataPtr(), 1, 4096, stream)
+    End While
+    Dim status As Integer = QueueClose(stream)
+    If status <> 0 Then Throw New RuntimeException("command failed: " + command)
+    Return data.ToString(Text.Encodings.UTF8)
+End Function
+
+Private Function JText(value As JSONItem) As String
+    Return value.AsString().Or("")
+End Function
+
+Private Function Has(values As Array Of String, value As String) As Boolean
+    For Each entry As String In values
+        If String.Compare(entry, value, True) = 0 Then Return True
+    Next
+    Return False
+End Function
+
+Private Function JoinPath(folder As String, name As String) As String
+    If String.StartsWith(name, "/", True) Then Return name
+    Return folder + "/" + name
+End Function
+
+Private Function Inside(filename As String, root As String) As String
+    ' GNU realpath resolves symlinks and missing tails without executing queue data.
+    Dim resolved As String = String.Trim(Capture("realpath -m -- " + helper_runtime.Q(filename)))
+    If resolved <> root And Not String.StartsWith(resolved, root + "/", True) Then Throw New RuntimeException("Path escapes workspace: " + filename)
+    Return resolved
+End Function
+
+Private Function ReadJSON(filename As String) As JSONItem
+    Return Json.Parse(helper_runtime.ReadText(filename))
+End Function
+
+Private Function Digest(filename As String) As String
+    ' Hash raw bytes, including NUL and non-UTF-8 input.
+    Dim output As String = Capture("sha256sum -- " + helper_runtime.Q(filename))
+    If String.StartsWith(output, "\\", True) Then output = String.Substring(output, 1)
+    Return String.Substring(output, 0, 64)
+End Function
+
+Private Function ReadIndex(queue As String) As JSONItem
+    Dim index As JSONItem = ReadJSON(Inside(queue + "/index.json", queue))
+    If Not index.IsObject() Or Not index.Value("schema").IsNumber() Or index.Value("schema").AsNumber().Or(0.0) <> 1.0 Then Throw New RuntimeException("queue index must be an object with schema 1")
+    Dim rows As JSONItem = index.Value("issues")
+    If Not rows.IsArray() Then Throw New RuntimeException("queue index issues must be an array")
+    Dim identifiers As Array Of String = []
+    Dim directories As Array Of String = []
+    For i As Integer = 0 To rows.Count() - 1
+        Dim row As JSONItem = rows.ValueAt(i)
+        If Not row.IsObject() Then Throw New RuntimeException("queue index issue " + Str(i) + " must be an object")
+        For Each key As String In ["id", "directory", "title", "status"]
+            If Not row.Value(key).IsString() Or String.Trim(JText(row.Value(key))) = "" Then Throw New RuntimeException("queue index issue " + Str(i) + " needs a nonempty string " + key)
+        Next
+        Dim status As String = JText(row.Value("status"))
+        If Not Has(["draft", "validated", "ready", "submitted", "duplicate", "not-reproduced"], status) Then Throw New RuntimeException("unknown queue status: " + status)
+        Dim directory As String = Inside(JoinPath(queue, JText(row.Value("directory"))), queue)
+        Dim identifier As String = JText(row.Value("id"))
+        If Has(identifiers, identifier) Or Has(directories, directory) Then Throw New RuntimeException("duplicate queue issue ID or directory: " + identifier)
+        Array.Append(identifiers, identifier)
+        Array.Append(directories, directory)
+    Next
+    Return index
+End Function
+
+Private Function LoadRow(queue As String, identifier As String) As JSONItem
+    Dim rows As JSONItem = ReadIndex(queue).Value("issues")
+    Dim found As JSONItem = Nil
+    Dim count As Integer = 0
+    For i As Integer = 0 To rows.Count() - 1
+        Dim row As JSONItem = rows.ValueAt(i)
+        If JText(row.Value("id")) = identifier Then
+            found = row
+            count += 1
+        End If
+    Next
+    If count <> 1 Then Throw New RuntimeException("Unknown or duplicate issue ID: " + identifier)
+    Return found
+End Function
+
+Private Function ValidateRecord(queue As String, identifier As String, ready As Boolean) As Array Of String
+    Dim errors As Array Of String = []
+    Dim row As JSONItem = LoadRow(queue, identifier)
+    Dim folder As String = Inside(JoinPath(queue, JText(row.Value("directory"))), queue)
+    Dim item As JSONItem = ReadJSON(Inside(folder + "/issue.json", queue))
+    Dim status As String = JText(item.Value("status"))
+    If item.Value("schema").AsNumber().Or(0.0) <> 1.0 Or JText(item.Value("id")) <> identifier Then Array.Append(errors, "invalid schema or mismatched issue ID")
+    If Not Has(["draft", "validated", "ready", "submitted", "duplicate", "not-reproduced"], status) Or JText(row.Value("status")) <> status Then Array.Append(errors, "invalid status or index status differs from issue record")
+    For Each key As String In ["title", "component", "platforms", "author", "expectedCompilerOutcome"]
+        Dim v As JSONItem = item.Value(key)
+        If v.IsNull() Or (v.IsString() And JText(v) = "") Or (v.IsArray() And v.Count() = 0) Or (v.IsObject() And v.Count() = 0) Or (v.IsBoolean() And Not v.AsBoolean().Or(False)) Or (v.IsNumber() And v.AsNumber().Or(0.0) = 0.0) Then Array.Append(errors, "missing " + key)
+    Next
+    Dim outcome As String = JText(item.Value("expectedCompilerOutcome"))
+    If Not Has(["clean", "diagnostic-failure"], outcome) Then Array.Append(errors, "unknown expected compiler outcome")
+    Dim names As Array Of String = []
+    Array.Append(names, JText(item.Value("repro")))
+    Array.Append(names, JText(item.Value("body")))
+    Dim evNames As JSONItem = item.Value("evidence")
+    Dim hasEvidence As Boolean = False
+    For i As Integer = 0 To evNames.Count() - 1
+        Dim name As String = JText(evNames.ValueAt(i))
+        Array.Append(names, name)
+        If name = "evidence.json" Then hasEvidence = True
+    Next
+    For Each name As String In names
+        If name = "" Or Not New FileSystemItem(Inside(JoinPath(folder, name), queue)).IsFile() Then Array.Append(errors, "missing evidence/repro/body file: " + name)
+    Next
+    Dim source As String = Inside(JoinPath(folder, JText(item.Value("repro"))), queue)
+    Dim evidencePath As String = Inside(folder + "/evidence.json", queue)
+    If Not New FileSystemItem(evidencePath).IsFile() Or Not hasEvidence Then Array.Append(errors, "required evidence.json file/reference missing")
+    If New FileSystemItem(source).IsFile() And New FileSystemItem(evidencePath).IsFile() Then
+        Dim evidence As JSONItem = ReadJSON(evidencePath)
+        If JText(evidence.Value("sourceSha256")) <> Digest(source) Then Array.Append(errors, "repro hash differs from recorded compiler/runtime evidence")
+        Dim checks As JSONItem = evidence.Value("compilerChecks")
+        Dim targets As Array Of String = []
+        For i As Integer = 0 To checks.Count() - 1
+            Dim command As JSONItem = checks.ValueAt(i).Value("command")
+            For j As Integer = 0 To command.Count() - 2
+                If JText(command.ValueAt(j)) = "--target" Then
+                    Array.Append(targets, JText(command.ValueAt(j + 1)))
+                    Exit For
+                End If
+            Next
+        Next
+        Dim complete As Boolean = checks.Count() = 6 And targets.Count = 6
+        For Each target As String In ["x86_64-linux", "arm64-linux", "x86_64-darwin", "arm64-darwin", "x86_64-windows", "arm64-windows"]
+            If Not Has(targets, target) Then complete = False
+        Next
+        If Not complete Then Array.Append(errors, "exactly the six supported desktop target compiler records required")
+        For i As Integer = 0 To checks.Count() - 1
+            Dim check As JSONItem = checks.ValueAt(i)
+            Dim code As JSONItem = check.Value("exitCode")
+            Dim diagnostics As JSONItem = check.Value("diagnostics").Value("errors")
+            If Not code.IsNumber() Or Not diagnostics.IsArray() Or code.AsNumber().Or(0.0) <> Math.Floor(code.AsNumber().Or(0.0)) Then Array.Append(errors, "compiler record needs integer exitCode and diagnostic errors array")
+            If outcome = "clean" And (code.AsNumber().Or(-1.0) <> 0.0 Or Not diagnostics.IsArray() Or diagnostics.Count() <> 0) Then Array.Append(errors, "clean reproduction has compiler errors/nonzero exit")
+            If outcome = "diagnostic-failure" And (diagnostics.Count() = 0 Or code.AsNumber().Or(-1.0) = 0.0) Then Array.Append(errors, "expected diagnostic failure was not recorded")
+        Next
+        If Has(["validated", "ready", "submitted"], status) Then
+            Dim validation As JSONItem = item.Value("validation")
+            Dim phase As String = "runtime"
+            If validation.HasKey("phase") Then phase = validation.Value("phase").AsString().Or("<invalid>")
+            If Not Has(["check", "build", "runtime"], phase) Then Array.Append(errors, "unknown validation phase")
+            Dim exists As Boolean = checks.Count() > 0
+            If Has(["build", "runtime"], phase) Then exists = Not evidence.Value(phase).IsNull() And evidence.Value(phase).Count() > 0
+            If Not validation.Value("localReproduction").AsBoolean().Or(False) Or Not exists Then Array.Append(errors, "confirmed " + phase + " issue requires matching local evidence")
+        End If
+    End If
+    Dim body As String = Inside(JoinPath(folder, JText(item.Value("body"))), queue)
+    If New FileSystemItem(body).IsFile() Then
+        If Digest(body) <> JText(item.Value("bodySha256")) Then Array.Append(errors, "public body changed after recorded review; refresh review and body hash")
+    End If
+    Dim searchPath As String = Inside(JoinPath(folder, JText(item.Value("duplicateSearch"))), queue)
+    Dim submission As JSONItem = item.Value("submission")
+    If Not New FileSystemItem(searchPath).IsFile() Then
+        Array.Append(errors, "duplicate search record missing")
+    Else
+        Dim search As JSONItem = ReadJSON(searchPath)
+        If JText(search.Value("repository")) <> JText(submission.Value("repository")) Or JText(search.Value("checkedAt")) = "" Then Array.Append(errors, "duplicate search has no date or repository mismatch")
+    End If
+    Dim reviews As JSONItem = item.Value("reviews")
+    Dim reproduced As Boolean = False
+    Dim accepted As Boolean = False
+    Dim parent As String = New FileSystemItem(queue).Parent.FullPath()
+    For i As Integer = 0 To reviews.Count() - 1
+        Dim review As JSONItem = reviews.ValueAt(i)
+        Dim reviewer As String = JText(review.Value("reviewer"))
+        If String.Trim(reviewer) = "" Then Array.Append(errors, "review must identify a reviewer")
+        If Not review.Value("independentReproduction").IsBoolean() Then Array.Append(errors, "review independentReproduction must be a boolean")
+        Dim name As String = JText(review.Value("evidence"))
+        If name = "" Or Not New FileSystemItem(Inside(JoinPath(parent, name), parent)).IsFile() Then Array.Append(errors, "review evidence missing for " + reviewer)
+        If JText(review.Value("objection")) = "" Or JText(review.Value("resolution")) = "" Then Array.Append(errors, "review must record concrete objection and resolution")
+        If reviewer <> "" And reviewer <> JText(item.Value("author")) Then
+            If review.Value("independentReproduction").AsBoolean().Or(False) Then reproduced = True
+            If Has(["accepted", "accepted-with-scope"], JText(review.Value("decision"))) Then accepted = True
+        End If
+    Next
+    If ready Or Has(["ready", "submitted"], status) Then
+        If Not Has(["ready", "submitted"], status) Then Array.Append(errors, "issue is " + status + ", not ready")
+        If Not reproduced Then Array.Append(errors, "independent peer reproduction missing")
+        If Not accepted Then Array.Append(errors, "challenger acceptance with resolved objections missing")
+    End If
+    If status = "submitted" Then
+        If JText(submission.Value("url")) = "" Then Array.Append(errors, "submitted issue needs remote URL")
+        If JText(submission.Value("submittedBodySha256")) <> JText(item.Value("bodySha256")) Then Array.Append(errors, "submitted body fingerprint differs; record a reviewed remote update explicitly")
+    End If
+    Return errors
+End Function
+
+Function Main(args As Array Of String) As Integer
+    Try
+        Dim queue As String = ""
+        Dim command As String = ""
+        Dim identifier As String = ""
+        Dim ready As Boolean = False
+        Dim i As Integer = 1
+        While i < args.Count
+            Dim arg As String = args(i)
+            If arg = "--queue" And i + 1 < args.Count And command = "" Then
+                i += 1
+                queue = args(i)
+            ElseIf arg = "--ready" And command = "validate" Then
+                ready = True
+            ElseIf arg = "--help" Or arg = "-h" Then
+                Print "Usage: upstream_issues [--queue PATH] list|validate [ID] [--ready]|render ID"
+                Print "Read-only Linux port; plan-submit and record-submission are unsupported. Requires realpath and sha256sum."
+                Return 0
+            ElseIf String.StartsWith(arg, "-", True) Then
+                Throw New RuntimeException("unexpected option: " + arg)
+            ElseIf command = "" Then
+                command = arg
+            ElseIf identifier = "" Then
+                identifier = arg
+            Else
+                Throw New RuntimeException("unexpected argument: " + arg)
+            End If
+            i += 1
+        End While
+        If Not Has(["list", "validate", "render"], command) Then Throw New RuntimeException("unsupported command: " + command + "; supported: list, validate, render")
+        If command = "list" And identifier <> "" Then Throw New RuntimeException("list accepts no issue ID")
+        If command = "render" And identifier = "" Then Throw New RuntimeException("render requires an issue ID")
+        If queue = "" Then queue = helper_runtime.WorkspaceRoot() + "/upstream-issues"
+        queue = String.Trim(Capture("realpath -m -- " + helper_runtime.Q(queue)))
+        Dim rows As JSONItem = ReadIndex(queue).Value("issues")
+        If command = "list" Then
+            For j As Integer = 0 To rows.Count() - 1
+                Dim row As JSONItem = rows.ValueAt(j)
+                Print JText(row.Value("id")) + "\t" + JText(row.Value("status")) + "\t" + JText(row.Value("title"))
+            Next
+        ElseIf command = "render" Then
+            Dim row As JSONItem = LoadRow(queue, identifier)
+            Dim folder As String = Inside(JoinPath(queue, JText(row.Value("directory"))), queue)
+            Dim item As JSONItem = ReadJSON(Inside(folder + "/issue.json", queue))
+            StdOut.Write(helper_runtime.ReadText(Inside(JoinPath(folder, JText(item.Value("body"))), queue)))
+        Else
+            Dim ids As Array Of String = []
+            If identifier <> "" Then
+                Array.Append(ids, identifier)
+            Else
+                For j As Integer = 0 To rows.Count() - 1
+                    Array.Append(ids, JText(rows.ValueAt(j).Value("id")))
+                Next
+            End If
+            Dim failed As Boolean = False
+            For Each id As String In ids
+                Dim errors As Array Of String = []
+                Try
+                    errors = ValidateRecord(queue, id, ready)
+                Catch e As Exception
+                    Array.Append(errors, "invalid issue record: " + e.Message)
+                End Try
+                If errors.Count = 0 Then
+                    Print id + ": valid"
+                Else
+                    Print id + ": " + String.Join(errors, "; ")
+                    failed = True
+                End If
+            Next
+            If failed Then Return 1
+        End If
+        Return 0
+    Catch e As Exception
+        StdErr.WriteLine("upstream_issues: " + e.Message)
+        Return 2
+    End Try
+End Function

@@ -1,0 +1,11 @@
+Import helper_runtime
+
+Function Main() As Integer
+    Try
+        Print helper_runtime.BuildPackage("pgsql")
+        Return 0
+    Catch e As Exception
+        StdErr.WriteLine("build_pgsql: " + e.Message)
+        Return 1
+    End Try
+End Function

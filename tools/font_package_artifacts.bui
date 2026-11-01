@@ -1,0 +1,255 @@
+Import helper_runtime As H
+Import Zip.Zip
+Package Crypto
+Function ReadBytes(filename As String) As Bytes
+    Dim opened As Result Of BinaryStream, IOError = BinaryStream.Open(New FileSystemItem(filename), False)
+    If opened.IsErr Then Throw New Exception("Cannot read " + filename)
+    Dim stream As BinaryStream = opened.Value
+    Try
+        Return stream.Read(stream.Length)
+    Finally
+        stream.Close()
+    End Try
+End Function
+
+Function SameJSON(a As JSONItem, b As JSONItem) As Boolean
+    If a.IsObject() <> b.IsObject() Or a.IsArray() <> b.IsArray() Then Return False
+    If a.IsObject() Then
+        If a.Count() <> b.Count() Then Return False
+        For Each key As String In a.Keys()
+            If Not b.HasKey(key) Then Return False
+            If Not SameJSON(a.Value(key), b.Value(key)) Then Return False
+        Next
+        Return True
+    End If
+    If a.IsArray() Then
+        If a.Count() <> b.Count() Then Return False
+        For i As Integer = 0 To a.Count() - 1
+            If Not SameJSON(a.ValueAt(i), b.ValueAt(i)) Then Return False
+        Next
+        Return True
+    End If
+    If (a.IsNumber() Or a.IsBoolean()) And (b.IsNumber() Or b.IsBoolean()) Then
+        Dim left As Double = a.AsNumber().Or(0.0)
+        Dim right As Double = b.AsNumber().Or(0.0)
+        If a.AsBoolean().Or(False) Then left = 1.0
+        If b.AsBoolean().Or(False) Then right = 1.0
+        Return left = right
+    End If
+    Return Json.Stringify(a) = Json.Stringify(b)
+End Function
+
+Function Contains(items As Array Of String, value As String) As Boolean
+    For Each item As String In items
+        If String.Compare(item, value, True) = 0 Then Return True
+    Next
+    Return False
+End Function
+
+Sub Collect(folder As FileSystemItem, prefix As String, files As Array Of String)
+    If Not folder.IsFolder() Then Return
+    For Each item As FileSystemItem In folder.Children()
+        Dim relative As String = prefix + item.Name()
+        If item.IsFile() Then
+            Array.Append(files, relative)
+        ElseIf item.IsFolder() Then
+            ' pathlib.rglob does not descend through directory symlinks.
+            If H.Run("test -L " + H.Q(item.FullPath())) = 0 Then Continue For
+            Collect(item, relative + "/", files)
+        End If
+    Next
+End Sub
+
+Function EntryBytes(reader As ZipReader, name As String) As Bytes
+    ' Python ZipFile resolves duplicate names to the last central-directory entry.
+    Dim found As Boolean = False
+    Dim selected As New Bytes()
+    Dim more As Boolean = reader.GotoFirstEntry()
+    While more
+        If String.Compare(reader.CurrentEntry.Name, name, True) = 0 Then
+            Dim data As Optional Of Bytes = reader.ExtractCurrentEntryToBytes()
+            If Not data.HasValue Then Throw New Exception("Cannot read archive entry " + name)
+            selected = data.Value
+            found = True
+        End If
+        more = reader.GotoNextEntry()
+    End While
+    If Not found Then Throw New Exception("Missing archive entry " + name)
+    Return selected
+End Function
+
+Function Digest(data As Bytes) As String
+    Return Crypto.Hash(Crypto.HashAlgorithms.SHA256, data).ToHex()
+End Function
+
+Function HasScheme(target As String) As Boolean
+    Dim letters As String = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+    If String.InStr(letters, String.Substring(target, 0, 1)) = 0 Then Return False
+    For i As Integer = 1 To String.Len(target) - 1
+        Dim c As String = String.Substring(target, i, 1)
+        If c = ":" Then Return True
+        If String.InStr(letters + "0123456789+.-", c) = 0 Then Return False
+    Next
+    Return False
+End Function
+
+Function Manual(base As String, name As String) As String
+    Dim source As String = H.ReadText(Path.Join(base, "README.md"))
+    source = String.Replace(source, "\r\n", "\n", String.Len(source) + 1, True)
+    source = String.Replace(source, "\r", "\n", String.Len(source) + 1, True)
+    Dim rendered As String = ""
+    Dim pos As Integer = 0
+    While pos < String.Len(source)
+        If String.Substring(source, pos, 2) = "](" Then
+            Dim finish As Integer = pos + 2
+            While finish < String.Len(source) And String.Substring(source, finish, 1) <> ")"
+                finish += 1
+            End While
+            If finish < String.Len(source) And finish > pos + 2 Then
+                Dim target As String = String.Substring(source, pos + 2, finish - pos - 2)
+                Dim first As String = String.Substring(target, 0, 1)
+                If first <> "#" And first <> "/" And first <> "<" And Not HasScheme(target) Then target = "../../" + target
+                rendered += "](" + target + ")"
+                pos = finish + 1
+                Continue While
+            End If
+        End If
+        rendered += String.Substring(source, pos, 1)
+        pos += 1
+    End While
+    Return "---\ntitle: \"" + name + " reference\"\nsummary: \"Capabilities, ownership, backends and verification.\"\ncategory: Reference\nrelated: [\"index.md\", \"getting-started.md\", \"typed-api.md\"]\n---\n\n" + rendered
+End Function
+
+Function Verify(root As String, name As String) As JSONItem
+    Dim base As String = Path.Join(root, "libraries/" + name)
+    Dim manifest As JSONItem = Json.Parse(H.ReadText(Path.Join(base, "manifest.json")))
+    Dim archive As String = name + "-" + manifest.Value("version").AsString().Value + ".buipkg"
+    Dim filename As String = Path.Join(root, "packages/" + archive)
+    Dim record As JSONItem = JSONItem.NewObject()
+    record.Value("sha256") = Digest(ReadBytes(filename))
+    record.Value("modules") = JSONItem.NewObject()
+    record.Value("nativeArtifacts") = JSONItem.NewObject()
+    record.Value("resources") = JSONItem.NewObject()
+    Dim packageName As String = manifest.Value("name").AsString().Value
+    If packageName <> "fontkit" And packageName <> "textmetrics" And packageName <> "shapingkit" And packageName <> "fontcanvas" Then Throw New Exception("Unknown font package " + packageName)
+    Dim native As String = "native/bridge.c"
+    If packageName = "textmetrics" Then native = "native/macos.c"
+    If packageName = "fontcanvas" Then native = "native/bridge.cpp"
+    Dim nativeDigest As String = Digest(ReadBytes(Path.Join(base, native)))
+    Dim opened As Result Of ZipReader, ZipError = ZipReader.Open(filename)
+    If opened.IsErr Then Throw New Exception(opened.Error.Message)
+    Dim reader As ZipReader = opened.Value
+    Try
+        Dim names As Array Of String = []
+        Dim more As Boolean = reader.GotoFirstEntry()
+        While more
+            Array.Append(names, reader.CurrentEntry.Name)
+            more = reader.GotoNextEntry()
+        End While
+        Dim sealed As JSONItem = Json.Parse(EntryBytes(reader, "manifest.json").ToString(Text.Encodings.UTF8))
+        For Each key As String In manifest.Keys()
+            If Not SameJSON(manifest.Value(key), sealed.Value(key)) Then Throw New Exception("source manifest field differs: " + key)
+        Next
+        Dim modules As Array Of String = []
+        Collect(New FileSystemItem(Path.Join(base, "modules")), "modules/", modules)
+        For Each relative As String In modules
+            If Not String.EndsWith(relative, ".bui", True) Then Continue For
+            Dim data As Bytes = EntryBytes(reader, relative)
+            If data.ToHex() <> ReadBytes(Path.Join(base, relative)).ToHex() Then Throw New Exception("stale module " + relative)
+            record.Value("modules").Value(relative) = Digest(data)
+        Next
+        For Each relative As String In names
+            If String.StartsWith(relative, "modules/", True) And String.EndsWith(relative, ".bui", True) And Not Contains(modules, relative) Then Throw New Exception("module list differs from source")
+            If Not String.StartsWith(relative, "runtime/", True) And Not String.StartsWith(relative, "link/", True) Then Continue For
+            If String.EndsWith(relative, "/", True) Then Continue For
+            Dim data As Bytes = EntryBytes(reader, relative)
+            If data.ToHex() <> ReadBytes(Path.Join(base, relative)).ToHex() Then Throw New Exception("stale native artifact " + relative)
+            If String.StartsWith(relative, "runtime/", True) And Not String.EndsWith(relative, ".source-sha256", True) Then
+                If String.Trim(H.ReadText(Path.Join(base, relative + ".source-sha256"))) <> nativeDigest Then Throw New Exception("native source receipt differs: " + relative)
+            End If
+            record.Value("nativeArtifacts").Value(relative) = Digest(data)
+        Next
+        Dim runtime As Array Of String = []
+        Collect(New FileSystemItem(Path.Join(base, "runtime")), "runtime/", runtime)
+        For Each relative As String In runtime
+            If Not String.EndsWith(relative, ".so", True) And Not String.EndsWith(relative, ".dll", True) And Not String.EndsWith(relative, ".dylib", True) Then Continue For
+            Dim receipt As String = Path.Join(base, relative + ".source-sha256")
+            If New FileSystemItem(receipt).IsFile() Then
+                If String.Trim(H.ReadText(receipt)) = nativeDigest And Not Contains(names, relative) Then Throw New Exception("missing current native slice " + relative)
+            End If
+        Next
+        Dim resources As Array Of String = []
+        Collect(New FileSystemItem(Path.Join(base, "resources")), "resources/", resources)
+        For Each relative As String In resources
+            Dim data As Bytes = EntryBytes(reader, relative)
+            If data.ToHex() <> ReadBytes(Path.Join(base, relative)).ToHex() Then Throw New Exception("stale/missing source resource " + relative)
+            record.Value("resources").Value(relative) = Digest(data)
+        Next
+        Dim manualPath As String = "resources/buoy-docs/reference.md"
+        Dim manualData As Bytes = EntryBytes(reader, manualPath)
+        If manualData.ToString(Text.Encodings.UTF8) <> Manual(base, packageName) Then Throw New Exception("stale/missing package manual " + manualPath)
+        Dim manualRecord As JSONItem = JSONItem.NewObject()
+        manualRecord.Value("path") = manualPath
+        manualRecord.Value("sha256") = Digest(manualData)
+        record.Value("manual") = manualRecord
+    Finally
+        reader.Close()
+    End Try
+    record.Value("nativeSourceSha256") = nativeDigest
+    Dim finalBytes As Bytes = ReadBytes(filename)
+    If Digest(finalBytes) <> record.Value("sha256").AsString().Value Then Throw New Exception("archive changed while verifying")
+    If finalBytes.ToHex() <> ReadBytes(Path.Join(root, "dist/" + archive)).ToHex() Then Throw New Exception("package/dist archive differs")
+    record.Value("matchingDist") = True
+    Return record
+End Function
+
+Function Main(args As Array Of String) As Integer
+    Try
+        Dim root As String = ""
+        Dim output As String = ""
+        Dim i As Integer = 1
+        While i < Array.Count(args)
+            Select Case args(i)
+            Case "--help", "-h"
+                Print "Usage: font_package_artifacts.bui [--root PATH] [--write-receipts PATH]"
+                Return 0
+            Case "--root", "--write-receipts"
+                Dim optionName As String = args(i)
+                i += 1
+                If i >= Array.Count(args) Then Throw New Exception("Missing value for " + optionName)
+                If optionName = "--root" Then
+                    root = args(i)
+                Else
+                    output = args(i)
+                End If
+            Case Else
+                Throw New Exception("Unknown option: " + args(i))
+            End Select
+            i += 1
+        End While
+        If root = "" Then root = H.WorkspaceRoot()
+        Dim records As JSONItem = JSONItem.NewObject()
+        Dim names As Array Of String = ["fontkit", "textmetrics", "shapingkit", "fontcanvas"]
+        For Each name As String In names
+            records.Value(name) = Verify(root, name)
+        Next
+        If output <> "" Then
+            Dim parent As String = New FileSystemItem(output).Parent.FullPath()
+            H.MakeDirectory(parent)
+            Dim temporary As String = String.Trim(H.Capture("mktemp " + H.Q(Path.Join(parent, ".font-receipts-XXXXXX"))))
+            Try
+                H.WriteText(temporary, Json.Stringify(records) + "\n")
+                H.RequireRun("mv -f " + H.Q(temporary) + " " + H.Q(output))
+            Finally
+                H.RequireRun("rm -f " + H.Q(temporary))
+            End Try
+        End If
+        For Each name As String In names
+            Print name + ": source/native/manual verified, mirrors identical, sha256=" + records.Value(name).Value("sha256").AsString().Value
+        Next
+        Return 0
+    Catch error As Exception
+        StdErr.WriteLine("font_package_artifacts: " + error.Message)
+        Return 1
+    End Try
+End Function

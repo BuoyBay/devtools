@@ -1,0 +1,577 @@
+' Native metadata-only package discovery. POSIX CLI; never extracts package files.
+' Requires bundled zip, crypto, regex. ZIP64 EOCD is rejected conservatively.
+Import helper_runtime As H
+Import zip.Zip
+Import crypto
+Import regex
+
+Private Sub Require(valid As Boolean, message As String)
+    If Not valid Then Throw New InvalidArgumentException(message)
+End Sub
+
+Private Function SafeText(value As JSONItem, limit As Integer = 256) As Boolean
+    If Not value.IsString() Then Return False
+    Dim content As String = value.AsString().Or("")
+    If String.Len(content) > limit Then Return False
+    For Each ch As String In String.Chars(content)
+        If String.Asc(ch) < 32 Then Return False
+    Next
+    Return True
+End Function
+
+Private Function BigEndian32(data As Bytes, offset As Integer) As Integer
+    Return ((data.Item(offset) * 256 + data.Item(offset + 1)) * 256 + data.Item(offset + 2)) * 256 + data.Item(offset + 3)
+End Function
+
+''' Byte-level icon check run before any decode: 33 bytes..64 KiB, the PNG
+''' signature followed by a 13-byte IHDR chunk, and IHDR width/height 1..512.
+''' Returns "" when acceptable, else the rejection message.
+Private Function PngProblem(data As Bytes) As String
+    If data Is Nil Then Return "icon image must be 33 bytes..64 KiB"
+    If data.Count < 33 Or data.Count > 65536 Then Return "icon image must be 33 bytes..64 KiB"
+    Dim signature As Array Of Integer = [137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82]
+    For i As Integer = 0 To Array.Count(signature) - 1
+        If data.Item(i) <> signature(i) Then Return "icon image must be a PNG"
+    Next
+    Dim w As Integer = BigEndian32(data, 16)
+    Dim h As Integer = BigEndian32(data, 20)
+    If w < 1 Or h < 1 Or w > 512 Or h > 512 Then Return "icon image must be at most 512x512"
+    Return ""
+End Function
+
+Private Function T(item As JSONItem, key As String) As String
+    Return item.Value(key).AsString().Or("")
+End Function
+
+Private Function Matches(value As String, pattern As String) As Boolean
+    Dim compiled As Result Of Regex, RegexError = Regex.Compile("\\A(?:" + pattern + ")\\z")
+    Require(compiled.IsOk, "invalid validation pattern")
+    Return compiled.Value.Find(value).HasValue
+End Function
+
+Private Function IntegerValue(item As JSONItem) As Boolean
+    Return item.IsNumber() And Matches(Json.Stringify(item), "-?[0-9]+")
+End Function
+
+Private Function Expression(kind As String, value As JSONItem, packageName As String) As Boolean
+    If Not value.IsString() Then Return False
+    Dim s As String = value.AsString().Or("")
+    If String.Len(s) > 4096 Then Return False
+    Select Case kind
+    Case "string"
+        If Not Matches(s, "\"(?:[^\"\\\\\\x00-\\x1f]|\\\\[nrt\"\\\\])*\"") Then Return False
+        Return Json.TryParse(s).HasValue
+    Case "boolean"
+        Return s = "True" Or s = "False"
+    Case "enum"
+        Return String.StartsWith(s, packageName + ".", True) And Matches(s, "[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)+")
+    Case "integer"
+        If Not Matches(s, "-?[0-9]+") Then Return False
+        ' Compare decimal magnitudes without converting through Double.
+        Dim digits As String = s
+        Dim limit As String = "9223372036854775807"
+        If String.StartsWith(s, "-") Then
+            digits = String.Substring(s, 1)
+            limit = "9223372036854775808"
+        End If
+        While String.Len(digits) > 1 And String.StartsWith(digits, "0")
+            digits = String.Substring(digits, 1)
+        End While
+        Return String.Len(digits) < 19 Or (String.Len(digits) = 19 And String.Compare(digits, limit, True) <= 0)
+    Case "double"
+        If Not Matches(s, "-?[0-9]+(?:\\.[0-9]+)?(?:e[+-]?[0-9]+)?") Then Return False
+        Dim n As Double = Json.Parse(s).AsNumber().Or(Double.Infinity)
+        Return n = n And n <> Double.Infinity And n <> -Double.Infinity
+    End Select
+    Return False
+End Function
+
+' The runtime parser keeps the last duplicate key. Check the original token
+' stream first, preserving per-object duplicate detection and nesting bounds.
+Private Class JsonGuard
+    Public Property Source As String
+    Public Property Position As Integer
+    Private Sub Space()
+        While Me.Position < String.Len(Me.Source)
+            If Not Array.Contains([" ", "\r", "\n", "\t"], String.Substring(Me.Source, Me.Position, 1), True) Then Exit While
+            Me.Position += 1
+        End While
+    End Sub
+    Private Function Token() As String
+        Dim start As Integer = Me.Position
+        Me.Position += 1
+        Dim escaped As Boolean = False
+        While Me.Position < String.Len(Me.Source)
+            Dim c As String = String.Substring(Me.Source, Me.Position, 1)
+            Me.Position += 1
+            If escaped Then
+                escaped = False
+            ElseIf c = "\\" Then
+                escaped = True
+            ElseIf c = "\"" Then
+                Return String.Substring(Me.Source, start, Me.Position - start)
+            End If
+        End While
+        Throw New InvalidArgumentException("unterminated JSON string")
+    End Function
+    Public Sub Walk(depth As Integer = 0, location As String = "")
+        Require(depth <= 24, "metadata nesting exceeds 24")
+        Me.Space()
+        Dim c As String = String.Substring(Me.Source, Me.Position, 1)
+        If c = "{" Or c = "[" Then
+            Dim objectMode As Boolean = c = "{"
+            Dim closing As String = "]"
+            If objectMode Then closing = "}"
+            Me.Position += 1
+            Me.Space()
+            Dim keys As Array Of String = []
+            Dim elementIndex As Integer = 0
+            While String.Substring(Me.Source, Me.Position, 1) <> closing
+                Require(Me.Position < String.Len(Me.Source), "invalid JSON")
+                Dim childPath As String = location + "/" + Str(elementIndex)
+                If objectMode Then
+                    Require(String.Substring(Me.Source, Me.Position, 1) = "\"", "invalid JSON object key")
+                    Dim key As String = Json.Parse(Me.Token()).AsString().Or("")
+                    Require(Not Array.Contains(keys, key, True), "duplicate JSON key: " + key)
+                    Array.Append(keys, key)
+                    childPath = location + "/" + key
+                    Me.Space()
+                    Require(String.Substring(Me.Source, Me.Position, 1) = ":", "invalid JSON")
+                    Me.Position += 1
+                End If
+                Me.Walk(depth + 1, childPath)
+                elementIndex += 1
+                Me.Space()
+                If String.Substring(Me.Source, Me.Position, 1) = closing Then Exit While
+                Require(String.Substring(Me.Source, Me.Position, 1) = ",", "invalid JSON")
+                Me.Position += 1
+                Me.Space()
+            End While
+            Me.Position += 1
+        ElseIf c = "\"" Then
+            Me.Token()
+        Else
+            Dim start As Integer = Me.Position
+            While Me.Position < String.Len(Me.Source)
+                c = String.Substring(Me.Source, Me.Position, 1)
+                If Array.Contains([",", "}", "]", " ", "\r", "\n", "\t"], c, True) Then Exit While
+                Me.Position += 1
+            End While
+            Require(Me.Position > start, "invalid JSON")
+            Dim token As String = String.Substring(Me.Source, start, Me.Position - start)
+            If Matches(token, "-?[0-9].*") And Not Matches(token, "-?[0-9]+") Then
+                If location = "/schema" Then Require(False, "unsupported package manifest schema")
+                If location = "/schemaVersion" Then Require(False, "unsupported descriptor schema/version")
+                If Matches(location, "/controls/[0-9]+/defaultWidth") Then Require(False, "invalid defaultWidth")
+                If Matches(location, "/controls/[0-9]+/defaultHeight") Then Require(False, "invalid defaultHeight")
+                If Matches(location, "/controls/[0-9]+/renderer/version") Then Require(False, "unsupported renderer version")
+                If Matches(location, "/controls/[0-9]+/icon/version") Then Require(False, "unsupported icon version")
+            End If
+            Require(token <> "NaN" And token <> "Infinity" And token <> "-Infinity", "non-finite JSON number: " + token)
+        End If
+    End Sub
+End Class
+
+Private Sub Bounded(item As JSONItem, depth As Integer = 0)
+    Require(depth <= 24, "metadata nesting exceeds 24")
+    If item.IsObject() Then
+        Require(item.Count() <= 1024, "metadata object/key too large")
+        For Each key As String In item.Keys()
+            Require(String.Len(key) <= 256, "metadata object/key too large")
+            Dim child As JSONItem = item.Value(key)
+            If key = "iconImageData" And child.IsString() Then
+                Require(String.Len(child.AsString().Or("")) <= 87384, "icon image data too large")
+            Else
+                Bounded(child, depth + 1)
+            End If
+        Next
+    ElseIf item.IsArray() Then
+        Require(item.Count() <= 16384, "metadata array too large")
+        For i As Integer = 0 To item.Count() - 1
+            Bounded(item.ValueAt(i), depth + 1)
+        Next
+    ElseIf item.IsString() Then
+        Require(String.Len(item.AsString().Or("")) <= 4096, "metadata string too large")
+    ElseIf item.IsNumber() Then
+        Dim n As Double = item.AsNumber().Or(0.0)
+        Require(n = n And n <> Double.Infinity And n <> -Double.Infinity, "non-finite number")
+    End If
+End Sub
+
+Private Function StrictJson(data As Bytes) As JSONItem
+    Require(data.Count <= 1048576, "metadata exceeds 1 MiB")
+    Dim guard As New JsonGuard()
+    guard.Source = data.ToString(Text.Encodings.UTF8)
+    guard.Walk()
+    Dim item As JSONItem = Json.Parse(guard.Source)
+    Bounded(item)
+    Return item
+End Function
+
+Private Sub ValidateRecipe(recipe As JSONItem, props As JSONItem, packageName As String, label As String)
+    Require(recipe.IsObject() And IntegerValue(recipe.Value("version")) And recipe.Value("version").AsNumber().Or(0.0) = 1.0, "unsupported " + label + " version")
+    Dim steps As JSONItem = recipe.Value("steps")
+    Require(steps.IsArray() And steps.Count() > 0 And steps.Count() <= 64, "invalid " + label + " steps")
+    For i As Integer = 0 To steps.Count() - 1
+        Dim s As JSONItem = steps.ValueAt(i)
+        Require(s.IsObject() And Array.Contains(["fillRect", "fillRoundedRect", "strokeRect", "strokeRoundedRect", "fillOval", "strokeOval", "text"], T(s, "op"), True), "unsupported " + label + " operation")
+        For Each key As String In s.Keys()
+            Require(Array.Contains(["op", "color", "darkColor", "x", "y", "inset", "width", "height", "radius", "lineWidth", "size", "prefix", "suffix", "property", "whenProperty", "equals", "elseColor"], key, True), "unknown " + label + " field")
+        Next
+        For Each key As String In ["color", "elseColor", "darkColor"]
+            If s.HasKey(key) Then
+                Dim rgb As JSONItem = s.Value(key)
+                Require(rgb.IsArray() And rgb.Count() = 3, "invalid RGB color")
+                For j As Integer = 0 To 2
+                    Dim n As Double = rgb.ValueAt(j).AsNumber().Or(-1.0)
+                    Require(rgb.ValueAt(j).IsNumber() And n >= 0.0 And n <= 1.0, "invalid RGB color")
+                Next
+            End If
+        Next
+        Require(s.HasKey("color"), label + " color required")
+        For Each key As String In ["x", "y", "inset", "width", "height", "radius", "size", "lineWidth"]
+            If s.HasKey(key) Then
+                Dim n As Double = s.Value(key).AsNumber().Or(-1.0)
+                If key = "lineWidth" Then
+                    Require(s.Value(key).IsNumber() And n > 0.0 And n <= 64.0, "invalid " + label + " line width")
+                Else
+                    Require(s.Value(key).IsNumber() And n >= 0.0 And n <= 1024.0, "invalid " + label + " geometry")
+                End If
+            End If
+        Next
+        For Each key As String In ["prefix", "suffix"]
+            If s.HasKey(key) Then Require(SafeText(s.Value(key), 1024), "invalid " + label + " text")
+        Next
+        For Each key As String In ["property", "whenProperty"]
+            If Not s.HasKey(key) Then Continue For
+            Dim found As Boolean = False
+            For j As Integer = 0 To props.Count() - 1
+                Dim p As JSONItem = props.ValueAt(j)
+                If T(p, "name") = T(s, key) Then
+                    found = True
+                    If key = "whenProperty" Then Require(Expression(T(p, "kind"), s.Value("equals"), packageName) And s.HasKey("elseColor"), "invalid " + label + " condition")
+                End If
+            Next
+            Require(found, "unknown " + label + " property")
+        Next
+    Next
+End Sub
+
+Private Sub Descriptor(d As JSONItem, manifest As JSONItem)
+    Require(d.IsObject(), "descriptor must be an object")
+    Require(T(d, "schema") = "buoy.designer.plugin" And IntegerValue(d.Value("schemaVersion")) And d.Value("schemaVersion").AsNumber().Or(0.0) = 1.0, "unsupported descriptor schema/version")
+    Dim p As JSONItem = d.Value("package")
+    Dim packageName As String = T(p, "name")
+    Require(p.IsObject() And Matches(packageName, "[a-z][a-z0-9_]{0,63}"), "invalid package name")
+    Require(Matches(T(p, "version"), "[0-9]+\\.[0-9]+\\.[0-9]+(?:-[A-Za-z0-9.-]+)?"), "invalid package version")
+    Require(SafeText(p.Value("provenance"), 512) And T(p, "provenance") <> "", "package provenance required")
+    Require(packageName = T(manifest, "name") And T(p, "version") = T(manifest, "version"), "descriptor/manifest identity mismatch")
+    Dim controls As JSONItem = d.Value("controls")
+    Require(controls.IsArray() And controls.Count() > 0 And controls.Count() <= 128, "expected 1..128 controls")
+    Dim seen As Array Of String = []
+    Dim editors As Array Of String = []
+    For i As Integer = 0 To controls.Count() - 1
+        Dim c As JSONItem = controls.ValueAt(i)
+        Require(c.IsObject(), "invalid control")
+        Dim name As String = T(c, "typeName")
+        Require(String.StartsWith(name, packageName + ".", True) And Matches(String.Substring(name, String.Len(packageName) + 1), "[A-Za-z_][A-Za-z0-9_]{0,63}"), "control must use package.Type identity")
+        Require(Not Array.Contains(seen, String.LCase(name), True), "duplicate control symbol")
+        Array.Append(seen, String.LCase(name))
+        Require(SafeText(c.Value("displayName")) And T(c, "displayName") <> "", "invalid displayName")
+        Dim imp As String = T(c, "sourceImport")
+        Require(String.StartsWith(imp, packageName + ".", True) And String.Len(imp) <= 256 And Matches(imp, "[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)+"), "invalid sourceImport")
+        For Each key As String In ["defaultWidth", "defaultHeight"]
+            Dim n As Double = c.Value(key).AsNumber().Or(0.0)
+            Require(IntegerValue(c.Value(key)) And n >= 1.0 And n <= 16384.0, "invalid " + key)
+        Next
+        Dim props As JSONItem = c.Value("properties")
+        Require(props.IsArray() And props.Count() <= 128, "invalid properties")
+        Dim names As Array Of String = []
+        For j As Integer = 0 To props.Count() - 1
+            Dim prop As JSONItem = props.ValueAt(j)
+            Dim pname As String = T(prop, "name")
+            Require(prop.IsObject() And Matches(pname, "[A-Za-z_][A-Za-z0-9_]{0,63}"), "invalid property name")
+            Require(Not Array.Contains(names, String.LCase(pname), True), "duplicate property symbol")
+            Array.Append(names, String.LCase(pname))
+            Require(Expression(T(prop, "kind"), prop.Value("defaultExpression"), packageName), "unsafe default expression")
+            For Each key As String In ["displayName", "category"]
+                If prop.HasKey(key) Then Require(SafeText(prop.Value(key)), "invalid property " + key)
+            Next
+            If prop.HasKey("metadata") Then Require(prop.Value("metadata").IsObject(), "invalid metadata")
+            Dim opts As JSONItem = JSONItem.NewArray()
+            If prop.HasKey("options") Then opts = prop.Value("options")
+            Require(opts.IsArray() And opts.Count() <= 64, "invalid choices")
+            Dim choices As Array Of String = []
+            For k As Integer = 0 To opts.Count() - 1
+                Dim v As JSONItem = opts.ValueAt(k)
+                Dim s As String = v.AsString().Or("")
+                Require(v.IsString() And Not Array.Contains(choices, s, True), "invalid choices")
+                Array.Append(choices, s)
+                Require(Expression(T(prop, "kind"), v, packageName), "unsafe choice expression")
+            Next
+            Require(opts.Count() = 0 Or Array.Contains(choices, T(prop, "defaultExpression"), True), "default must be a choice")
+            Require(T(prop, "kind") <> "enum" Or opts.Count() > 0, "enum needs choices")
+            Dim editor As String = T(prop, "editorId")
+            ' Preserve the oracle's optional-field truthiness before type validation.
+            Dim editorValue As JSONItem = prop.Value("editorId")
+            Dim hasEditor As Boolean = editor <> ""
+            If editorValue.IsNumber() Then hasEditor = editorValue.AsNumber().Or(0.0) <> 0.0
+            If editorValue.IsBoolean() Then hasEditor = editorValue.AsBoolean().Or(False)
+            If editorValue.IsArray() Or editorValue.IsObject() Then hasEditor = editorValue.Count() > 0
+            If hasEditor Then
+                Require(SafeText(prop.Value("editorId")) And String.StartsWith(editor, name + ".", True) And Matches(editor, "[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)+") And opts.Count() > 0, "choice editor id must be control-qualified")
+                Require(Not Array.Contains(editors, String.LCase(editor), True), "duplicate editor symbol")
+                Array.Append(editors, String.LCase(editor))
+            End If
+        Next
+        ValidateRecipe(c.Value("renderer"), props, packageName, "renderer")
+        For Each key As String In ["category", "description"]
+            Dim limit As Integer = 256
+            If key = "category" Then limit = 64
+            If c.HasKey(key) Then Require(SafeText(c.Value(key), limit) And String.Trim(T(c, key)) <> "", "invalid control " + key)
+        Next
+        If c.HasKey("icon") Then
+            If c.Value("icon").IsString() Then
+                Require(SafeText(c.Value("icon"), 64) And T(c, "icon") <> "", "invalid icon glyph name")
+            Else
+                ValidateRecipe(c.Value("icon"), props, packageName, "icon")
+            End If
+        End If
+        If c.HasKey("iconImage") Then
+            Dim location As String = T(c, "iconImage")
+            Require(String.Len(location) <= 128 And Matches(location, "[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\\.[Pp][Nn][Gg]"), "invalid iconImage path")
+            For Each part As String In String.Split(location, "/")
+                Require(part <> "." And part <> "..", "invalid iconImage path")
+            Next
+        End If
+        If c.HasKey("iconImageData") Then
+            Require(c.Value("iconImageData").IsString(), "invalid iconImageData")
+            Dim decoded As Result Of Bytes, String = Bytes.FromBase64(T(c, "iconImageData"))
+            Require(decoded.IsOk, "invalid iconImageData encoding")
+            Dim problem As String = PngProblem(decoded.Value)
+            Require(problem = "", problem)
+        End If
+    Next
+End Sub
+Private Function ReadFile(location As String) As Bytes
+    Dim file As New FileSystemItem(location)
+    Dim opened As Result Of BinaryStream, IOError = BinaryStream.Open(file, False)
+    Require(opened.IsOk, "cannot read archive")
+    Dim stream As BinaryStream = opened.Value
+    Dim data As Bytes
+    Try
+        data = stream.Read(268435457)
+    Finally
+        stream.Close()
+    End Try
+    Require(data.Count <= 268435456, "archive exceeds 256 MiB")
+    Return data
+End Function
+
+Private Function LE(data As Bytes, offset As Integer, count As Integer) As Integer
+    Require(offset >= 0 And offset + count <= data.Count, "File is not a zip file")
+    Dim n As Integer = 0
+    For i As Integer = count - 1 To 0 Step -1
+        n = n * 256 + data.Item(offset + i)
+    Next
+    Return n
+End Function
+
+' ZipEntry omits Unix external attributes. Inspect the central directory before
+' opening any member so a symlink anywhere in the archive rejects the package.
+Private Sub CentralDirectory(data As Bytes)
+    Dim ending As Integer = -1
+    For i As Integer = data.Count - 22 To Math.Max(0, data.Count - 65557) Step -1
+        If LE(data, i, 4) = 101010256 Then
+            If i + 22 + LE(data, i + 20, 2) = data.Count Then
+                ending = i
+                Exit For
+            End If
+        End If
+    Next
+    Require(ending >= 0, "File is not a zip file")
+    Dim count As Integer = LE(data, ending + 10, 2)
+    Require(count <= 16384, "too many archive entries")
+    Dim offset As Integer = LE(data, ending + 16, 4)
+    Require(offset <> 4294967295, "ZIP64 archives are not supported")
+    For i As Integer = 0 To count - 1
+        Require(LE(data, offset, 4) = 33639248, "Bad magic number for central directory")
+        Dim nameLength As Integer = LE(data, offset + 28, 2)
+        For j As Integer = 0 To nameLength - 1
+            Require(LE(data, offset + 46 + j, 1) <> 0, "unsafe archive path")
+        Next
+        Dim mode As Integer = LE(data, offset + 40, 2)
+        Require((mode And 61440) <> 40960, "archive symlink forbidden")
+        offset += 46 + LE(data, offset + 28, 2) + LE(data, offset + 30, 2) + LE(data, offset + 32, 2)
+    Next
+End Sub
+
+Private Function Member(reader As ZipReader, name As String, limit As Integer = 1048576, icon As Boolean = False) As Bytes
+    Require(reader.LocateEntry(name, False), "There is no item named '" + name + "' in the archive")
+    Dim entry As ZipEntry = reader.CurrentEntry
+    Dim message As String = "metadata ZIP bomb"
+    If icon Then message = "icon image ZIP bomb or too large"
+    Dim compressed As Integer = entry.CompressedSize
+    If compressed < 1 Then compressed = 1
+    Require(entry.UncompressedSize <= limit And entry.UncompressedSize <= compressed * 200, message)
+    message = "encrypted metadata forbidden"
+    If icon Then message = "encrypted icon image forbidden"
+    Require((CType(entry.Flag, Integer) And 1) = 0, message)
+    Dim extracted As Optional Of Bytes = reader.ExtractCurrentEntryToBytes()
+    Require(extracted.HasValue, "corrupt ZIP member: " + name)
+    Require(extracted.Value.Count <= limit, "metadata exceeds size limit")
+    Return extracted.Value
+End Function
+
+Private Function Archive(location As String, claimed As JSONItem) As JSONItem
+    Dim raw As Bytes = ReadFile(location)
+    CentralDirectory(raw)
+    Dim opened As Result Of ZipReader, ZipError = ZipReader.Open(location)
+    Require(opened.IsOk, "File is not a zip file")
+    Dim reader As ZipReader = opened.Value
+    Try
+        Dim names As Array Of String = []
+        Dim more As Boolean = reader.GotoFirstEntry()
+        While more
+            Dim name As String = reader.CurrentEntry.Name
+            Require(name <> "" And Not String.StartsWith(name, "/") And Not String.Contains(name, "\\") And Not String.Contains(name, ":"), "unsafe archive path")
+            For Each ch As String In String.Chars(name)
+                Require(String.Asc(ch) <> 0, "unsafe archive path")
+            Next
+            For Each part As String In String.Split(name, "/")
+                Require(part <> "." And part <> "..", "unsafe archive path")
+            Next
+            Require(Not Array.Contains(names, String.LCase(name), True), "duplicate archive path")
+            Array.Append(names, String.LCase(name))
+            Require(Array.Count(names) <= 16384, "too many archive entries")
+            more = reader.GotoNextEntry()
+        End While
+        Dim manifest As JSONItem = StrictJson(Member(reader, "manifest.json"))
+        Require(manifest.IsObject(), "invalid manifest")
+        Require(IntegerValue(manifest.Value("schema")) And manifest.Value("schema").AsNumber().Or(0.0) = 1.0, "unsupported package manifest schema")
+        Dim name As String = T(manifest, "name")
+        Require(Matches(name, "[a-z][a-z0-9_]{0,63}"), "invalid manifest name")
+        If claimed.HasKey(name) Then Return Nil
+        claimed.Value(name) = True
+        Dim resource As String = "resources/buoy-designer/plugin.json"
+        If Not reader.LocateEntry(resource, False) Then Return Nil
+        Dim descriptorItem As JSONItem = StrictJson(Member(reader, resource))
+        Descriptor(descriptorItem, manifest)
+        Dim warnings As JSONItem = JSONItem.NewArray()
+        Dim controls As JSONItem = descriptorItem.Value("controls")
+        For i As Integer = 0 To controls.Count() - 1
+            Dim c As JSONItem = controls.ValueAt(i)
+            If Not c.HasKey("iconImage") Or c.HasKey("iconImageData") Then Continue For
+            Dim memberName As String = "resources/buoy-designer/" + T(c, "iconImage")
+            If Not reader.LocateEntry(memberName, False) Then
+                Dim warning As New JSONItem()
+                warning.Value("typeName") = T(c, "typeName")
+                warning.Value("message") = "iconImage not found in package: " + memberName
+                warnings.Add(warning)
+            Else
+                Dim data As Bytes = Member(reader, memberName, 65536, True)
+                Dim problem As String = PngProblem(data)
+                Require(problem = "", problem)
+                c.Value("iconImageData") = data.ToBase64()
+            End If
+        Next
+        Dim reportItem As New JSONItem()
+        reportItem.Value("descriptor") = descriptorItem
+        Dim file As New FileSystemItem(location)
+        reportItem.Value("origin") = file.FullPath()
+        reportItem.Value("sha256") = Crypto.Hash(Crypto.HashAlgorithms.SHA256, raw).ToHex()
+        If warnings.Count() > 0 Then reportItem.Value("warnings") = warnings
+        Return reportItem
+    Finally
+        reader.Close()
+    End Try
+End Function
+
+Function Main(args As Array Of String) As Integer
+    Try
+        Dim project As String = String.Trim(H.Capture("pwd -P"))
+        Dim globalDir As String = System.EnvironmentVariable("XDG_DATA_HOME").Or(Path.Join(System.EnvironmentVariable("HOME").Or(""), ".local/share")) + "/buoy/packages"
+        If String.Trim(H.Capture("uname -s")) = "Darwin" Then globalDir = Path.Join(System.EnvironmentVariable("HOME").Or(""), "Library/Application Support/buoy/packages")
+        Dim output As String = ""
+        Dim i As Integer = 1
+        While i < Array.Count(args)
+            Dim arg As String = args(i)
+            If arg = "--help" Or arg = "-h" Then
+                Print "Usage: discover_layout_packages.bui [--project PROJECT] [--global-dir DIR] [--output FILE]"
+                Return 0
+            End If
+            Dim optionValue As String = ""
+            Dim equalPosition As Integer = String.IndexOf(arg, "=")
+            If equalPosition >= 0 Then
+                optionValue = String.Substring(arg, equalPosition + 1)
+                arg = String.Left(arg, equalPosition)
+            End If
+            If Not Array.Contains(["--project", "--global-dir", "--output"], arg, True) Or (equalPosition < 0 And i + 1 >= Array.Count(args)) Then
+                StdErr.WriteLine("invalid argument: " + arg)
+                Return 2
+            End If
+            If equalPosition < 0 Then
+                i += 1
+                optionValue = args(i)
+            End If
+            Select Case arg
+            Case "--project"
+                project = optionValue
+            Case "--global-dir"
+                globalDir = optionValue
+            Case "--output"
+                output = optionValue
+            End Select
+            i += 1
+        End While
+        If output = "" Then output = Path.Join(project, ".buoy/designer/index-v1.json")
+        Dim projectFile As New FileSystemItem(project)
+        project = projectFile.FullPath()
+        Dim reportItem As New JSONItem()
+        reportItem.Value("schema") = "buoy.designer.index"
+        reportItem.Value("schemaVersion") = 1
+        Dim packages As JSONItem = JSONItem.NewArray()
+        Dim errors As JSONItem = JSONItem.NewArray()
+        Dim claimed As New JSONItem()
+        For Each directory As String In [Path.Join(project, "packages"), globalDir]
+            Dim folder As New FileSystemItem(directory)
+            If Not folder.IsFolder() Then Continue For
+            Dim paths As Array Of String = H.Sources(directory, "", ".buipkg")
+            Require(Array.Count(paths) <= 4096, "too many package archives")
+            For Each location As String In paths
+                Try
+                    Dim entry As JSONItem = Archive(location, claimed)
+                    If entry IsNot Nil Then packages.Add(entry)
+                Catch e As Exception
+                    Dim errorItem As New JSONItem()
+                    errorItem.Value("path") = location
+                    errorItem.Value("message") = e.Message
+                    errors.Add(errorItem)
+                End Try
+            Next
+        Next
+        reportItem.Value("packages") = packages
+        reportItem.Value("errors") = errors
+        Dim serialized As String = Json.Stringify(reportItem)
+        Require(String.LenBytes(serialized) <= 8388608, "index exceeds 8 MiB")
+        Dim destination As New FileSystemItem(output)
+        H.MakeDirectory(destination.ParentPath())
+        Dim temporary As String = String.Trim(H.Capture("mktemp " + H.Q(output + ".XXXXXX")))
+        Try
+            H.WriteText(temporary, serialized + "\n")
+            H.RequireRun("mv -f " + H.Q(temporary) + " " + H.Q(output))
+        Finally
+            Dim tempFile As New FileSystemItem(temporary)
+            If tempFile.Exists() Then tempFile.Delete()
+        End Try
+        Dim summary As New JSONItem()
+        summary.Value("index") = output
+        summary.Value("packages") = packages.Count()
+        summary.Value("errors") = errors
+        Print Json.Stringify(summary)
+    Catch e As Exception
+        StdErr.WriteLine(e.Message)
+        Return 1
+    End Try
+    Return 0
+End Function

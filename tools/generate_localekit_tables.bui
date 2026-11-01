@@ -1,0 +1,242 @@
+' Generate exact-integer CLDR 49 predicates from the pinned official JSON.
+Import helper_runtime As H
+Package Crypto
+Declare Sub ExitProcess Lib "c" Alias "exit" (code As Int32)
+
+Function ReadBytes(filename As String) As Bytes
+    Dim opened As Result Of BinaryStream, IOError = BinaryStream.Open(New FileSystemItem(filename), False)
+    If opened.IsErr Then Throw New Exception("Cannot read " + filename)
+    Dim stream As BinaryStream = opened.Value
+    Try
+        Return stream.Read(stream.Length)
+    Finally
+        stream.Close()
+    End Try
+End Function
+
+' Match pathlib.read_text universal newline handling for generated source text.
+Function ReadSourceText(filename As String) As String
+    Dim content As String = H.ReadText(filename)
+    content = String.Replace(content, "\r\n", "\n")
+    Return String.Replace(content, "\r", "\n")
+End Function
+
+Function HexEscape(codepoint As Integer) As String
+    Dim value As Integer = codepoint
+    Dim encoded As String = ""
+    For i As Integer = 1 To 4
+        encoded = String.Mid("0123456789abcdef", value Mod 16 + 1, 1) + encoded
+        value = value \ 16
+    Next
+    Return "\\u" + encoded
+End Function
+
+' Match Python json.dumps default ASCII escaping, including supplementary planes.
+Function QuoteString(value As String) As String
+    Dim encoded As String = "\""
+    For i As Integer = 1 To String.Len(value)
+        Dim ch As String = String.Mid(value, i, 1)
+        Dim codepoint As Integer = String.Asc(ch)
+        If codepoint >= 127 Then
+            If codepoint > 65535 Then
+                codepoint -= 65536
+                encoded += HexEscape(55296 + codepoint \ 1024)
+                codepoint = 56320 + codepoint Mod 1024
+            End If
+            encoded += HexEscape(codepoint)
+        Else
+            Dim escaped As String = Json.Stringify(JSONItem.From(ch))
+            encoded += String.Mid(escaped, 2, String.Len(escaped) - 2)
+        End If
+    Next
+    Return encoded + "\""
+End Function
+
+Sub VerifySources(base As String)
+    Dim record As JSONItem = Json.Parse(H.ReadText(base + "/data/source.json"))
+    If record.Value("cldr_version").AsString().Or("") <> "49" Or record.Value("tag").AsString().Or("") <> "49.0.0" Then Throw New Exception("Unsupported CLDR source version; update generator deliberately")
+    Dim hashes As JSONItem = record.Value("sha256")
+    If Not hashes.IsObject() Or hashes.Count() <> 2 Or Not hashes.HasKey("plurals.json") Or Not hashes.HasKey("ordinals.json") Then Throw New Exception("CLDR source manifest must pin both plural input files")
+    For Each name As String In ["ordinals.json", "plurals.json"]
+        Dim raw As Bytes = ReadBytes(base + "/data/" + name)
+        If String.Compare(Crypto.Hash(Crypto.HashAlgorithms.SHA256, raw).ToHex(), hashes.Value(name).AsString().Or(""), True) <> 0 Then Throw New Exception("CLDR source hash mismatch: " + name)
+        Dim source As JSONItem = Json.Parse(raw.ToString(Text.Encodings.UTF8))
+        If source.Value("supplemental").Value("version").Value("_cldrVersion").AsString().Or("") <> "49" Then Throw New Exception("CLDR input version mismatch: " + name)
+    Next
+End Sub
+
+Function DigitsOnly(value As String, allowed As String) As Boolean
+    If value = "" Then Return False
+    For i As Integer = 1 To String.Len(value)
+        If String.InStr(allowed, String.Mid(value, i, 1)) = 0 Then Return False
+    Next
+    Return True
+End Function
+
+Function Relation(raw As String) As String
+    Dim parts As Array Of String = String.Split(raw, " ")
+    If Array.Count(parts) <> 3 And Array.Count(parts) <> 5 Then Throw New Exception(raw)
+    Dim operand As String = parts(0)
+    If String.Len(operand) <> 1 Or String.InStr("nivwftce", operand, 1, True) = 0 Then Throw New Exception(raw)
+    If Array.Count(parts) = 5 Then
+        If parts(1) <> "%" Or Not DigitsOnly(parts(2), "0123456789") Then Throw New Exception(raw)
+    End If
+    Dim operatorIndex As Integer = Array.Count(parts) - 2
+    If parts(operatorIndex) <> "=" And parts(operatorIndex) <> "!=" Then Throw New Exception(raw)
+    If Not DigitsOnly(parts(operatorIndex + 1), "0123456789.,") Then Throw New Exception(raw)
+    Dim member As String = ""
+    Select Case operand
+    Case "n", "i"
+        member = "IntegerPart"
+    Case "v"
+        member = "VisibleDigits"
+    Case "w"
+        member = "TrimmedDigits"
+    Case "f"
+        member = "Fraction"
+    Case "t"
+        member = "TrimmedFraction"
+    Case Else
+        member = "Exponent"
+    End Select
+    Dim lhs As String = "p." + member
+    Dim offset As Integer = 1
+    If parts(1) = "%" Then
+        lhs = "(" + lhs + " Mod " + parts(2) + ")"
+        offset = 3
+    End If
+    Dim predicates As Array Of String = []
+    For Each item As String In String.Split(parts(offset + 1), ",")
+        If String.InStr(item, "..") > 0 Then
+            Dim bounds As Array Of String = String.Split(item, "..")
+            If Array.Count(bounds) <> 2 Then Throw New Exception(raw)
+            Array.Append(predicates, "(" + lhs + " >= " + bounds(0) + " And " + lhs + " <= " + bounds(1) + ")")
+        Else
+            Array.Append(predicates, lhs + " = " + item)
+        End If
+    Next
+    Dim expr As String = "(" + String.Join(predicates, " Or ") + ")"
+    If operand = "n" Then expr = "(p.Fraction = 0 And " + expr + ")"
+    If parts(offset) = "!=" Then expr = "(Not " + expr + ")"
+    Return expr
+End Function
+
+Function RuleCondition(raw As String) As String
+    Dim branches As Array Of String = []
+    For Each branch As String In String.Split(raw, " or ")
+        Dim terms As Array Of String = []
+        For Each term As String In String.Split(branch, " and ")
+            Array.Append(terms, Relation(term))
+        Next
+        Array.Append(branches, "(" + String.Join(terms, " And ") + ")")
+    Next
+    Return "(" + String.Join(branches, " Or ") + ")"
+End Function
+
+Function Generated(base As String) As String
+    VerifySources(base)
+    Dim lines As Array Of String = []
+    Array.Append(lines, ReadSourceText(base + "/data/LocaleKit.bui.in"))
+    Array.Append(lines, "' Generated CLDR predicates; do not edit below this line.")
+    Dim allLocales As JSONItem = JSONItem.NewObject()
+    For Each mode As String In ["Cardinal", "Ordinal"]
+        Dim filename As String = "plurals.json"
+        If mode = "Ordinal" Then filename = "ordinals.json"
+        Dim source As JSONItem = Json.Parse(H.ReadText(base + "/data/" + filename)).Value("supplemental").Value("plurals-type-" + String.LCase(mode))
+        If Not source.IsObject() Then Throw New Exception("CLDR plural rules must be an object: " + filename)
+        Dim signatures As Array Of String = []
+        Dim rulesets As Array Of JSONItem = []
+        Dim localeGroups As Array Of JSONItem = []
+        For Each locale As String In source.Keys()
+            allLocales.Value(locale) = True
+            Dim rules As JSONItem = source.Value(locale)
+            If Not rules.IsObject() Then Throw New Exception("CLDR locale rules must be an object: " + locale)
+            Dim signature As JSONItem = JSONItem.NewArray()
+            For Each key As String In rules.Keys()
+                If key = "pluralRule-count-other" Then Continue For
+                Dim pair As JSONItem = JSONItem.NewArray()
+                Dim category As String = key
+                If String.StartsWith(category, "pluralRule-count-", True) Then category = String.Mid(category, 18)
+                pair.Add(JSONItem.From(category))
+                If Not rules.Value(key).IsString() Then Throw New Exception("CLDR rule must be a string: " + key)
+                Dim pieces As Array Of String = String.Split(rules.Value(key).AsString().Or(""), "@")
+                pair.Add(JSONItem.From(String.Trim(pieces(0))))
+                signature.Add(pair)
+            Next
+            Dim serialized As String = Json.Stringify(signature)
+            Dim index As Integer = -1
+            For i As Integer = 0 To Array.Count(signatures) - 1
+                If String.Compare(signatures(i), serialized, True) = 0 Then index = i
+            Next
+            If index = -1 Then
+                index = Array.Count(signatures)
+                Array.Append(signatures, serialized)
+                Array.Append(rulesets, signature)
+                Array.Append(localeGroups, JSONItem.NewArray())
+            End If
+            localeGroups(index).Add(JSONItem.From(String.LCase(locale)))
+        Next
+        Array.Append(lines, "Private Function Locale" + mode + "Rule(locale As String, p As PluralOperands) As String")
+        Array.Append(lines, "    Select Case locale")
+        For i As Integer = 0 To Array.Count(signatures) - 1
+            If rulesets(i).Count() = 0 Then Continue For
+            Dim locales As Array Of String = []
+            For j As Integer = 0 To localeGroups(i).Count() - 1
+                Array.Append(locales, QuoteString(localeGroups(i).ValueAt(j).AsString().Or("")))
+            Next
+            Array.Append(lines, "    Case " + String.Join(locales, ", "))
+            For j As Integer = 0 To rulesets(i).Count() - 1
+                Dim pair As JSONItem = rulesets(i).ValueAt(j)
+                Array.Append(lines, "        If " + RuleCondition(pair.ValueAt(1).AsString().Or("")) + " Then Return " + QuoteString(pair.ValueAt(0).AsString().Or("")))
+            Next
+        Next
+        For Each line As String In ["    End Select", "    Return \"other\"", "End Function", ""]
+            Array.Append(lines, line)
+        Next
+    Next
+    Array.Append(lines, "Private Function LocaleKnownRule(locale As String) As Boolean")
+    Array.Append(lines, "    Select Case locale")
+    Dim names As Array Of String = allLocales.Keys()
+    Array.Sort(names)
+    For i As Integer = 0 To Array.Count(names) - 1 Step 20
+        Dim chunk As Array Of String = []
+        For j As Integer = i To i + 19
+            If j >= Array.Count(names) Then Exit For
+            Array.Append(chunk, QuoteString(String.LCase(names(j))))
+        Next
+        Array.Append(lines, "    Case " + String.Join(chunk, ", "))
+        Array.Append(lines, "        Return True")
+    Next
+    For Each line As String In ["    End Select", "    Return False", "End Function", ""]
+        Array.Append(lines, line)
+    Next
+    Return String.Join(lines, "\n")
+End Function
+
+Sub Main(args As Array Of String)
+    Try
+        Dim check As Boolean = False
+        For i As Integer = 1 To Array.Count(args) - 1
+            Select Case args(i)
+            Case "--check"
+                check = True
+            Case "--help", "-h"
+                Print "usage: generate_localekit_tables.bui [--check]"
+                Return
+            Case Else
+                Throw New Exception("unrecognized argument: " + args(i))
+            End Select
+        Next
+        Dim base As String = H.WorkspaceRoot() + "/libraries/localekit"
+        Dim content As String = Generated(base)
+        Dim destination As String = base + "/modules/LocaleKit.bui"
+        If check Then
+            If String.Compare(ReadSourceText(destination), content, True) <> 0 Then Throw New Exception("PluralRules.bui differs; regenerate")
+        Else
+            H.WriteText(destination, content)
+        End If
+    Catch e As Exception
+        StdErr.WriteLine(e.Message)
+        ExitProcess(1)
+    End Try
+End Sub

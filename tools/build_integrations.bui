@@ -1,0 +1,17 @@
+Import helper_runtime
+
+' Keep package selection and dependency handling in one canonical builder.
+' This entry point requires Python 3, just like tools/build_integrations.py.
+Function Main(args As Array Of String) As Integer
+    Try
+        Dim root As String = helper_runtime.WorkspaceRoot()
+        Dim command As String = "python3 " + helper_runtime.Q(Path.Join(root, "tools/build_integrations.py"))
+        For i As Integer = 1 To args.Count - 1
+            command += " " + helper_runtime.Q(args(i))
+        Next
+        Return helper_runtime.Run(command, root)
+    Catch e As Exception
+        StdErr.WriteLine("build_integrations: " + e.Message)
+        Return 1
+    End Try
+End Function

@@ -1,0 +1,502 @@
+' Native package verification and sealing. Subprocesses receive argument arrays.
+Import ProcessKit
+
+#If Not TargetWindows Then
+Private Declare Function ReadSymbolicLink Lib "c" Alias "readlink" (filename As String, buffer As Ptr, capacity As UInt64) As Int64
+#End If
+
+Private Function ReadText(file As FileSystemItem) As String
+    Dim value As Result Of String, String = file.ReadAllText()
+    If value.IsErr Then Throw New IOException("Cannot read " + file.FullPath() + ": " + value.Error)
+    Return value.Value
+End Function
+
+Private Function ReadJSON(file As FileSystemItem) As JSONItem
+    Return Json.Parse(ReadText(file))
+End Function
+
+Private Function RequiredString(value As JSONItem, key As String) As String
+    Dim item As JSONItem = value.Value(key)
+    If Not item.IsString() Then Throw New InvalidArgumentException("Expected string: " + key)
+    Return item.AsString().Value
+End Function
+
+Private Sub SafeName(value As String)
+    If value = "" Then Throw New InvalidArgumentException("Package name is empty")
+    For Each character As String In String.Chars(value)
+        If Not String.Contains("abcdefghijklmnopqrstuvwxyz0123456789_-", character, True) Then Throw New InvalidArgumentException("Unsafe package name: " + value)
+    Next
+End Sub
+
+Private Sub SafeRelative(value As String)
+    If value = "" Or String.Contains(value, "\\") Or String.Contains(value, ":") Then Throw New InvalidArgumentException("Invalid package input: " + value)
+    For Each part As String In String.Split(value, "/")
+        If part = "" Or part = "." Or part = ".." Or part = ".git" Then Throw New InvalidArgumentException("Unsafe package input: " + value)
+    Next
+End Sub
+
+Private Sub NoSymlink(item As FileSystemItem)
+    #If Not TargetWindows Then
+        Dim buffer As New Bytes(1)
+        If ReadSymbolicLink(item.FullPath(), buffer.DataPtr(), 1) >= 0 Then Throw New IOException("Symbolic package input is unsupported: " + item.FullPath())
+    #End If
+End Sub
+
+Private Sub CopyTree(source As FileSystemItem, destination As FileSystemItem)
+    NoSymlink(source)
+    If source.IsFolder() Then
+        If Not destination.CreateFolder(True) Then Throw New IOException("Cannot create " + destination.FullPath())
+        For Each child As FileSystemItem In source.Children()
+            CopyTree(child, destination.Child(child.Name()))
+        Next
+    ElseIf source.IsFile() Then
+        If Not destination.Parent.CreateFolder(True) Then Throw New IOException("Cannot create " + destination.ParentPath())
+        If Not source.CopyTo(destination) Then Throw New IOException("Cannot copy " + source.FullPath())
+        #If Not TargetWindows Then
+            destination.Permissions.Mode = source.Permissions.Mode And &o777
+        #End If
+    Else
+        Throw New IOException("Missing or unsupported input: " + source.FullPath())
+    End If
+End Sub
+
+Private Sub CopyRelative(source As FileSystemItem, destination As FileSystemItem, relative As String)
+    SafeRelative(relative)
+    Dim cursor As FileSystemItem = source
+    For Each part As String In String.Split(relative, "/")
+        cursor = cursor.Child(part)
+        NoSymlink(cursor)
+    Next
+    CopyTree(source.Child(relative), destination.Child(relative))
+End Sub
+
+Private Class CommandResult
+    Public Property Output As String
+    Public Property ErrorText As String
+    Public Property Code As Integer
+End Class
+
+Private Function Run(executable As String, arguments As Array Of String, directory As String) As CommandResult
+    Dim child As New PipeProcess(executable, arguments, directory, True)
+    Dim commandOutcome As New CommandResult()
+    Dim output As New Bytes()
+    Dim errors As New Bytes()
+    Dim started As Double = DateTime.Now().SecondsFrom1970
+    Try
+        child.CloseInput()
+        While True
+            Dim outPart As Bytes = child.ReadOutput()
+            Dim errPart As Bytes = child.ReadError()
+            If outPart.Count > 0 Then output.Append(outPart.DataPtr(), outPart.Count)
+            If errPart.Count > 0 Then errors.Append(errPart.DataPtr(), errPart.Count)
+            If output.Count + errors.Count > 16777216 Then
+                child.TerminateTree()
+                Throw New IOException("Tool output exceeded 16 MiB: " + executable)
+            End If
+            Dim running As Boolean = child.Poll()
+            If Not running And child.OutputClosed And child.ErrorClosed Then Exit While
+            If DateTime.Now().SecondsFrom1970 - started > 180 Then
+                child.TerminateTree()
+                Throw New IOException("Tool exceeded 180 seconds: " + executable)
+            End If
+            Thread.Sleep(5)
+        End While
+        commandOutcome.Code = child.ExitCode
+        commandOutcome.Output = output.ToString(Text.Encodings.UTF8)
+        commandOutcome.ErrorText = errors.ToString(Text.Encodings.UTF8)
+        Return commandOutcome
+    Finally
+        child.Close()
+    End Try
+End Function
+
+Private Function ResolveExecutable(value As String) As String
+    If value = "" Then Throw New InvalidArgumentException("Empty executable selection")
+    If String.StartsWith(value, "/") Then
+        If Not New FileSystemItem(value).IsFile() Then Throw New IOException("Executable is missing: " + value)
+        Return value
+    End If
+    If String.Contains(value, "/") Then Throw New InvalidArgumentException("Executable paths must be absolute: " + value)
+    For Each directory As String In String.Split(System.EnvironmentVariable("PATH").Or("/usr/bin:/bin"), ":")
+        If Not String.StartsWith(directory, "/") Then Continue For
+        Dim file As FileSystemItem = New FileSystemItem(directory).Child(value)
+        If file.IsFile() Then Return file.FullPath()
+    Next
+    Throw New IOException("Executable not found on absolute PATH entries: " + value)
+End Function
+
+Private Sub NeedSuccess(commandOutcome As CommandResult, description As String)
+    If commandOutcome.Code <> 0 Then Throw New IOException(description + " failed (" + String.From(commandOutcome.Code) + ")\n" + commandOutcome.Output + commandOutcome.ErrorText)
+End Sub
+
+Private Function Targets() As Array Of String
+    Return ["arm64-darwin", "x86_64-darwin", "arm64-linux", "x86_64-linux", "arm64-windows", "x86_64-windows"]
+End Function
+
+Private Sub CollectModules(folder As FileSystemItem, paths As Array Of String)
+    If Not folder.IsFolder() Then Return
+    For Each child As FileSystemItem In folder.Children()
+        NoSymlink(child)
+        If child.IsFolder() Then
+            CollectModules(child, paths)
+        ElseIf String.EndsWith(child.Name(), ".bui") Then
+            Array.Append(paths, child.FullPath())
+        End If
+    Next
+End Sub
+
+Private Function StandaloneModules(modules As Array Of String) As Array Of String
+    Dim imported As JSONItem = JSONItem.NewObject()
+    For Each sourcePath As String In modules
+        For Each sourceLine As String In String.Split(ReadText(New FileSystemItem(sourcePath)), "\n")
+            Dim line As String = String.Trim(sourceLine)
+            If String.StartsWith(String.LCase(line), "public import ") Then line = String.Trim(String.Mid(line, 8))
+            If Not String.StartsWith(String.LCase(line), "import ") Then Continue For
+            Dim token As String = String.Split(String.Trim(String.Mid(line, 7)), " ")(0)
+            Dim parts As Array Of String = String.Split(token, ".")
+            If parts.Count > 0 Then imported.Value(String.LCase(parts(parts.Count - 1))) = True
+        Next
+    Next
+    Dim entries As Array Of String = []
+    For Each sourcePath As String In modules
+        Dim file As New FileSystemItem(sourcePath)
+        Dim hasPartialClass As Boolean = String.Contains(ReadText(file), "Partial Class", True)
+        If Not hasPartialClass Or Not imported.HasKey(String.LCase(file.NameWithoutExtension())) Then Array.Append(entries, sourcePath)
+    Next
+    Return entries
+End Function
+
+Private Sub CheckLinkInputs(folder As FileSystemItem)
+    If Not folder.IsFolder() Then Return
+    For Each child As FileSystemItem In folder.Children()
+        NoSymlink(child)
+        If child.IsFolder() Then
+            CheckLinkInputs(child)
+        ElseIf child.IsFile() And child.Ext() <> "tbd" Then
+            Throw New IOException("Native link binary requires a specialized build adapter: " + child.FullPath())
+        End If
+    Next
+End Sub
+
+Private Class PackageBuilder
+    Public Property Root As FileSystemItem
+    Public Property OutputDirectory As FileSystemItem
+    Public Property Work As FileSystemItem
+    Public Property Compiler As String = "buoy"
+    Public Property Packager As String = "buoy"
+    Public Property CheckOnly As Boolean = False
+    Public Property CompileConsumer As Boolean = False
+    Public Property Active As Map Of String, Boolean = New Map Of String, Boolean()
+    Public Property Done As Map Of String, String = New Map Of String, String()
+    Public Property Report As JSONItem = JSONItem.NewArray()
+
+    Private Function FindSource(name As String) As FileSystemItem
+        SafeName(name)
+        ' Standard independent repositories take precedence over compatibility trees.
+        If Me.Root.Child("manifest.json").IsFile() Then
+            If RequiredString(ReadJSON(Me.Root.Child("manifest.json")), "name") = name Then Return Me.Root
+            Dim sibling As FileSystemItem = Me.Root.Parent.Child(name)
+            If sibling.Child("manifest.json").IsFile() Then Return sibling
+        End If
+        Dim folder As FileSystemItem = Me.Root.Child("repos/" + name)
+        If folder.Child("manifest.json").IsFile() Then Return folder
+        folder = Me.Root.Child("libraries/" + name)
+        If folder.Child("manifest.json").IsFile() Then Return folder
+        folder = Me.Root.Child("repos/" + name + "/libraries/" + name)
+        If folder.Child("manifest.json").IsFile() Then Return folder
+        Return Nil
+    End Function
+
+    Public Function Source(name As String) As FileSystemItem
+        Dim folder As FileSystemItem = Me.FindSource(name)
+        If folder = Nil Then Throw New IOException("Missing package source: " + name)
+        Return folder
+    End Function
+
+    Private Function ExistingArchive(name As String) As FileSystemItem
+        Dim folders As Array Of FileSystemItem = []
+        Array.Append(folders, Me.OutputDirectory)
+        Array.Append(folders, Me.Root.Child("packages"))
+        Array.Append(folders, Me.Root.Child("repos/" + name + "/packages"))
+        Dim selected As Optional Of String = System.EnvironmentVariable("BUOY_PACKAGES_DIR")
+        If selected.HasValue Then Array.Append(folders, New FileSystemItem(selected.Value))
+        Array.Append(folders, New FileSystemItem("/usr/share/buoy/packages"))
+        Array.Append(folders, New FileSystemItem("/Applications/Buoy/packages"))
+        For Each folder As FileSystemItem In folders
+            Dim found As FileSystemItem = Nil
+            If Not folder.IsFolder() Then Continue For
+            For Each file As FileSystemItem In folder.Children()
+                If String.StartsWith(String.LCase(file.Name()), String.LCase(name) + "-") And String.EndsWith(file.Name(), ".buipkg") Then
+                    If found <> Nil Then Throw New IOException("Ambiguous dependency archive: " + name + " in " + folder.FullPath())
+                    found = file
+                End If
+            Next
+            If found <> Nil Then Return found
+        Next
+        Throw New IOException("Missing dependency source/archive: " + name)
+    End Function
+
+    Private Sub InstalledImports(folder As FileSystemItem, ownName As String, settings As JSONItem)
+        Dim sources As Array Of String = []
+        CollectModules(folder.Child("modules"), sources)
+        For Each sourcePath As String In sources
+            For Each sourceLine As String In String.Split(ReadText(New FileSystemItem(sourcePath)), "\n")
+                Dim line As String = String.Trim(sourceLine)
+                If String.StartsWith(String.LCase(line), "public import ") Then line = String.Trim(String.Mid(line, 8))
+                If Not String.StartsWith(String.LCase(line), "import ") Then Continue For
+                Dim imported As String = String.Split(String.Split(String.Trim(String.Mid(line, 7)), " ")(0), ".")(0)
+                Dim name As String = String.LCase(imported)
+                If name = ownName Or settings.Value("dependencies").HasKey(name) Then Continue For
+                Dim ownModule As Boolean = False
+                For Each modulePath As String In sources
+                    If String.LCase(New FileSystemItem(modulePath).NameWithoutExtension()) = name Then ownModule = True
+                Next
+                If ownModule Then Continue For
+                ' Only explicitly imported installed packages are admitted; sibling source
+                ' dependencies must be declared so their source is rebuilt first.
+                If Me.FindSource(name) <> Nil Then
+                    Throw New IOException("Undeclared local package import: " + ownName + " -> " + name)
+                End If
+                Try
+                    Dim archive As FileSystemItem = Me.ExistingArchive(name)
+                    Dim destination As FileSystemItem = Me.Work.Child("packages/" + archive.Name())
+                    If Not destination.IsFile() Then CopyTree(archive, destination)
+                    ' The installed Xojo package documents this complete shim closure.
+                    ' Its public module imports all shims even when only Variant is used.
+                    If name = "xojo" Then
+                        For Each required As String In ["regex", "crypto", "zip", "sqlite3", "postgres", "xml"]
+                            Dim support As FileSystemItem = Me.ExistingArchive(required)
+                            Dim supportDestination As FileSystemItem = Me.Work.Child("packages/" + support.Name())
+                            If Not supportDestination.IsFile() Then CopyTree(support, supportDestination)
+                        Next
+                    End If
+                Catch e As IOException
+                    ' A module import can be compiler stdlib; semantic checking resolves it.
+                End Try
+            Next
+        Next
+    End Sub
+
+    Public Function Build(name As String) As String
+        SafeName(name)
+        If Me.Done.ContainsKey(name) Then Return Me.Done.Get(name).Value
+        If Me.Active.ContainsKey(name) Then Throw New IOException("Dependency cycle: " + name)
+        Me.Active.Set(name, True)
+        Try
+            Return Me.BuildOne(name)
+        Finally
+            Me.Active.Remove(name)
+        End Try
+    End Function
+
+    Private Function BuildOne(name As String) As String
+        Dim folder As FileSystemItem = Me.Source(name)
+        NoSymlink(folder)
+        Dim manifest As JSONItem = ReadJSON(folder.Child("manifest.json"))
+        If RequiredString(manifest, "name") <> name Then Throw New IOException("Package identity mismatch: " + name)
+        Dim version As String = RequiredString(manifest, "version")
+        SafeRelative(version)
+        Dim settings As JSONItem = JSONItem.NewObject()
+        If folder.Child("bpm.json").IsFile() Then settings = ReadJSON(folder.Child("bpm.json"))
+        Dim dependencies As JSONItem = settings.Value("dependencies")
+        If dependencies.IsNull() Then dependencies = JSONItem.NewObject()
+        If Not dependencies.IsObject() Then Throw New IOException("Invalid dependencies: " + name)
+        For Each dependency As String In dependencies.Keys()
+            SafeName(dependency)
+            If Me.FindSource(dependency) <> Nil Then
+                Me.Build(dependency)
+            Else
+                CopyTree(Me.ExistingArchive(dependency), Me.Work.Child("packages/" + Me.ExistingArchive(dependency).Name()))
+            End If
+        Next
+        Dim libraries As JSONItem = manifest.Value("libraries")
+        If libraries.IsArray() Then
+            For i As Integer = 0 To libraries.Count() - 1
+                If Not libraries.ValueAt(i).Value("system").AsBoolean().Or(False) Then Throw New IOException(name + ": native library needs a specialized builder; this tool does not rebuild or validate native slices")
+            Next
+        End If
+        CheckLinkInputs(folder.Child("link"))
+        If folder.Child("TOOLCHAIN-REQUIREMENTS.md").IsFile() Then Throw New IOException(name + ": explicit toolchain requirement; read TOOLCHAIN-REQUIREMENTS.md and use its specialized workflow")
+        Dim stage As FileSystemItem = Me.Work.Child("sources/" + name)
+        If Not stage.CreateFolder(True) Then Throw New IOException("Cannot create package stage")
+        Dim files As JSONItem = settings.Value("files")
+        If files.IsArray() Then
+            For i As Integer = 0 To files.Count() - 1
+                CopyRelative(folder, stage, files.ValueAt(i).AsString().Value)
+            Next
+        Else
+            For Each item As String In ["manifest.json", "modules", "declares", "resources", "link", "runtime", "LICENSE", "LICENSE.md", "LICENSE-MIT.txt", "LICENSE-APACHE.txt", "LICENSE-DOCS.txt", "NOTICE.md", "README.md", "PROVENANCE.md", "UPSTREAM-LICENSE.txt"]
+                If folder.Child(item).Exists() Then CopyRelative(folder, stage, item)
+            Next
+        End If
+        ' Buoy's sealer includes conventional resources, not arbitrary root files.
+        ' Retain original legal inputs in the portable compiler archive as resources.
+        For Each legal As FileSystemItem In folder.Children()
+            Dim legalName As String = String.LCase(legal.Name())
+            If legal.IsFile() And (String.StartsWith(legalName, "license") Or String.StartsWith(legalName, "licensing") Or String.StartsWith(legalName, "notice") Or String.StartsWith(legalName, "copyright") Or String.StartsWith(legalName, "copying") Or String.StartsWith(legalName, "upstream-license") Or String.StartsWith(legalName, "provenance")) Then
+                CopyTree(legal, stage.Child("resources/buoybay-licenses/" + legal.Name()))
+            End If
+        Next
+        CopyRelative(folder, stage, "manifest.json")
+        If folder.Child("bpm.json").IsFile() Then CopyRelative(folder, stage, "bpm.json")
+        Me.InstalledImports(stage, name, settings)
+        Dim filename As String = name + "-" + version + ".buipkg"
+        Dim archive As FileSystemItem = Me.Work.Child("packages/" + filename)
+        NeedSuccess(Run(Me.Packager, ["pkg", "seal", stage.FullPath(), "-o", archive.FullPath()], Me.Work.FullPath()), "Seal " + name)
+        Dim modules As Array Of String = []
+        CollectModules(stage.Child("modules"), modules)
+        Array.Sort(modules)
+        If modules.Count = 0 Then Throw New IOException(name + ": no Buoy module entrypoints")
+        Dim checkEntries As Array Of String = StandaloneModules(modules)
+        If checkEntries.Count = 0 Then Throw New IOException(name + ": partial-class import cycle has no standalone checking entrypoint")
+        For Each source As String In checkEntries
+            For Each target As String In Targets()
+                Dim commandOutcome As CommandResult = Run(Me.Compiler, [source, "--check", "--diagnostic-format", "json", "--target", target], Me.Work.FullPath())
+                Dim diagnostics As JSONItem = Json.Parse(commandOutcome.Output)
+                Dim errors As JSONItem = diagnostics.Value("errors")
+                Dim warnings As JSONItem = diagnostics.Value("warnings")
+                If commandOutcome.Code <> 0 Or Not errors.IsArray() Or errors.Count() <> 0 Or Not warnings.IsArray() Then Throw New IOException(name + " check failed for " + target + "\n" + commandOutcome.Output + commandOutcome.ErrorText)
+                If warnings.Count() > 0 Then Print Json.Stringify(diagnostics)
+            Next
+        Next
+        Dim consumerBuilt As Boolean = False
+        If Me.CompileConsumer Then
+            Dim consumer As FileSystemItem = Me.Work.Child("consumer-" + name + ".bui")
+            Dim imports As String = ""
+            Dim selfNamed As Boolean = False
+            For Each modulePath As String In modules
+                If String.LCase(New FileSystemItem(modulePath).NameWithoutExtension()) = name Then selfNamed = True
+            Next
+            If selfNamed Then
+                imports = "Import " + name + "\n"
+            Else
+                Dim prefix As String = stage.Child("modules").FullPath() + "/"
+                For Each modulePath As String In modules
+                    Dim relative As String = String.Mid(modulePath, String.Len(prefix) + 1)
+                    relative = String.Left(relative, String.Len(relative) - 4)
+                    relative = String.Replace(relative, "/", ".", String.Len(relative) + 1, True)
+                    imports += "Import " + name + "." + relative + "\n"
+                Next
+            End If
+            Dim outcome As Result Of Integer, String = consumer.WriteAllText(imports + "Sub Main()\n    Print \"" + name + " consumer compiled\"\nEnd Sub\n")
+            If outcome.IsErr Then Throw New IOException(outcome.Error)
+            NeedSuccess(Run(Me.Compiler, [consumer.FullPath(), "-o", Me.Work.Child("consumer-" + name).FullPath()], Me.Work.FullPath()), "Compile consumer " + name)
+            consumerBuilt = True
+        End If
+        Dim record As JSONItem = JSONItem.NewObject()
+        record.Value("status") = "passed"
+        record.Value("consumerCompiled") = consumerBuilt
+        record.Value("licensePayloadPath") = "resources/buoybay-licenses"
+        record.Value("name") = name
+        record.Value("version") = version
+        record.Value("moduleEntrypoints") = checkEntries.Count
+        record.Value("moduleFiles") = modules.Count
+        record.Value("compilerTargets") = 6
+        record.Value("nativeRuntimeVerified") = False
+        record.Value("published") = Not Me.CheckOnly
+        If Not Me.CheckOnly Then
+            If Not Me.OutputDirectory.CreateFolder(True) Then Throw New IOException("Cannot create output directory")
+            Dim pending As FileSystemItem = Me.OutputDirectory.Child(filename + ".pending-" + String.From(CurrentProcessId()))
+            If pending.Exists() Then Throw New IOException("Previous publication pending: " + pending.FullPath())
+            CopyTree(archive, pending)
+            Dim output As FileSystemItem = Me.OutputDirectory.Child(filename)
+            If Not pending.MoveTo(output) Then Throw New IOException("Cannot atomically publish " + output.FullPath())
+            record.Value("archive") = output.FullPath()
+        End If
+        Me.Report.Add(record)
+        Me.Done.Set(name, archive.FullPath())
+        Print "Verified " + name + " " + version + " (six targets)"
+        Return archive.FullPath()
+    End Function
+End Class
+
+Function Main(args As Array Of String) As Integer
+    Try
+        #If TargetWindows Then
+            Throw New InvalidArgumentException("Native package builder currently runs on POSIX hosts; Windows targets are compiler-checked from POSIX")
+        #End If
+        Dim builder As New PackageBuilder()
+        builder.Compiler = System.EnvironmentVariable("BUOY").Or("buoy")
+        builder.Packager = System.EnvironmentVariable("BPM_PACKAGER").Or("")
+        Dim rootPath As String = ""
+        Dim outputPath As String = ""
+        Dim names As Array Of String = []
+        Dim continueAfterFailure As Boolean = False
+        Dim failures As Integer = 0
+        Dim index As Integer = 1
+        While index < args.Count
+            Dim argument As String = args(index)
+            If argument = "--help" Then
+                Print "usage: build-packages --root PATH [--output-dir PATH] [--compiler EXECUTABLE] [--packager EXECUTABLE] [--check-only] [--compile-consumer] [--continue-on-error] NAME..."
+                Print "Pure-source and system-library packages; declared local dependencies build first."
+                Print "Native runtime builders remain separate; partial fragments check through import roots."
+                Return 0
+            ElseIf argument = "--continue-on-error" Then
+                continueAfterFailure = True
+            ElseIf argument = "--compile-consumer" Then
+                builder.CompileConsumer = True
+            ElseIf argument = "--check-only" Then
+                builder.CheckOnly = True
+            ElseIf argument = "--root" Or argument = "--output-dir" Or argument = "--compiler" Or argument = "--packager" Then
+                index += 1
+                If index >= args.Count Then Throw New InvalidArgumentException("Missing value for " + argument)
+                Select Case argument
+                    Case "--root"
+                        rootPath = args(index)
+                    Case "--output-dir"
+                        outputPath = args(index)
+                    Case "--compiler"
+                        builder.Compiler = args(index)
+                    Case "--packager"
+                        builder.Packager = args(index)
+                End Select
+            ElseIf String.StartsWith(argument, "-") Then
+                Throw New InvalidArgumentException("Unknown option: " + argument)
+            Else
+                Array.Append(names, argument)
+            End If
+            index += 1
+        End While
+        If rootPath = "" Or names.Count = 0 Then Throw New InvalidArgumentException("Pass --root PATH and at least one package; use --help")
+        builder.Root = New FileSystemItem(rootPath)
+        If Not String.StartsWith(builder.Root.FullPath(), "/") Then Throw New InvalidArgumentException("--root must be absolute")
+        If outputPath = "" Then outputPath = builder.Root.Child("dist/packages").FullPath()
+        builder.OutputDirectory = New FileSystemItem(outputPath)
+        If Not String.StartsWith(outputPath, "/") Then Throw New InvalidArgumentException("--output-dir must be absolute")
+        builder.Compiler = ResolveExecutable(builder.Compiler)
+        If builder.Packager = "" Then
+            builder.Packager = builder.Compiler
+            If builder.Compiler = "/usr/local/bin/buoy" And New FileSystemItem("/usr/bin/buoy").IsFile() Then builder.Packager = "/usr/bin/buoy"
+        End If
+        builder.Packager = ResolveExecutable(builder.Packager)
+        builder.Work = builder.Root.Child("local/native-package-build/run-" + String.From(CurrentProcessId()))
+        If builder.Work.Exists() Then Throw New IOException("Previous build directory exists: " + builder.Work.FullPath())
+        If Not builder.Work.Child("packages").CreateFolder(True) Then Throw New IOException("Cannot create isolated build directory")
+        For Each name As String In names
+            Try
+                builder.Build(name)
+            Catch e As Exception
+                failures += 1
+                Dim failure As JSONItem = JSONItem.NewObject()
+                failure.Value("name") = name
+                failure.Value("status") = "failed"
+                failure.Value("error") = e.Message
+                builder.Report.Add(failure)
+                StdErr.WriteLine(name + ": " + e.Message)
+                If Not continueAfterFailure Then Exit For
+            End Try
+        Next
+        Dim report As JSONItem = JSONItem.NewObject()
+        report.Value("schema") = 1
+        report.Value("scope") = "source semantic checks and source sealing; no native runtime execution or specialized native adapter verification"
+        report.Value("packages") = builder.Report
+        Dim written As Result Of Integer, String = builder.Work.Child("report.json").WriteAllText(Json.Stringify(report))
+        If written.IsErr Then Throw New IOException(written.Error)
+        Print "Report: " + builder.Work.Child("report.json").FullPath()
+        If failures > 0 Then Return 1
+        Return 0
+    Catch e As Exception
+        StdErr.WriteLine(e.Message)
+        Return 1
+    End Try
+End Function

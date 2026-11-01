@@ -1,0 +1,217 @@
+' POSIX-host platform audit. Run with ahoy tools/platform_audit.bui.
+' Uses native Buoy JSON and shell orchestration; no Python runtime.
+Import helper_runtime As H
+
+Function Locate(command As String) As String
+    Dim sh As New Shell
+    Try
+        ' Search executable files rather than shell builtins (for example true or echo).
+        Dim script As String = "candidate=" + H.Q(command) + "; "
+        script += "case $candidate in */*) [ -f \"$candidate\" ] && [ -x \"$candidate\" ] && printf '%s\\n' \"$candidate\"; exit;; esac; "
+        script += "remaining=${PATH-'/bin:/usr/bin'}:; while [ -n \"$remaining\" ]; do directory=${remaining%%:*}; remaining=${remaining#*:}; "
+        script += "[ -n \"$directory\" ] || directory=.; found=$directory/$candidate; "
+        script += "if [ -f \"$found\" ] && [ -x \"$found\" ]; then printf '%s\\n' \"$found\"; exit 0; fi; done; exit 1"
+        Dim output As String = sh.Execute("( " + script + " )")
+        If sh.LastExitCode = 0 Then Return String.Trim(output)
+        Return ""
+    Finally
+        sh.Close()
+    End Try
+End Function
+
+Function ExecutableRecord(command As String) As JSONItem
+    Dim capability As JSONItem = JSONItem.NewObject()
+    Dim located As String = Locate(command)
+    capability.Value("command") = command
+    capability.Value("available") = located <> ""
+    capability.Value("path") = JSONItem.Null()
+    If located <> "" Then
+        capability.Value("path") = located
+        Dim resolved As String = String.Trim(H.Capture("realpath " + H.Q(located)))
+        capability.Value("resolved_path") = resolved
+        capability.Value("script_wrapper") = JSONItem.Null()
+        Try
+            capability.Value("script_wrapper") = H.Capture("head -c 2 " + H.Q(resolved)) = "#!"
+        Catch e As Exception
+            capability.Value("script_wrapper") = JSONItem.Null()
+        End Try
+    End If
+    Return capability
+End Function
+
+Function RunProbe(arguments As Array Of String, root As String, directory As String) As JSONItem
+    Dim record As JSONItem = JSONItem.NewObject()
+    Dim command As String = ""
+    Dim executable As String = Locate(arguments(0))
+    Dim vector As JSONItem = JSONItem.NewArray()
+    For Each argument As String In arguments
+        vector.Add(argument)
+        If vector.Count() = 1 Then
+            command += H.Q(executable) + " "
+        Else
+            command += H.Q(argument) + " "
+        End If
+    Next
+    record.Value("command") = vector
+    If executable = "" Then
+        record.Value("status") = "unavailable"
+        record.Value("error") = "Executable not found or not executable: " + arguments(0)
+        Return record
+    End If
+    Dim sh As New Shell
+    sh.Timeout = 30000
+    Try
+        Dim ignored As String = sh.Execute("cd " + H.Q(root) + " && " + command + " >" + H.Q(directory + "/stdout") + " 2>" + H.Q(directory + "/stderr"))
+        record.Value("returncode") = sh.LastExitCode + 0.0
+        record.Value("status") = "failed"
+        If sh.LastExitCode = 0 Then record.Value("status") = "passed"
+        record.Value("stdout") = String.Right(H.ReadText(directory + "/stdout"), 12000)
+        record.Value("stderr") = String.Right(H.ReadText(directory + "/stderr"), 12000)
+    Catch e As ShellException
+        sh.Kill()
+        record.Value("status") = "timeout"
+    Finally
+        sh.Close()
+    End Try
+    Return record
+End Function
+
+Sub DiagnosticStatus(record As JSONItem)
+    If record.Value("status").AsString().Or("") <> "passed" Then Return
+    Try
+        Dim diagnostics As JSONItem = Json.Parse(record.Value("stdout").AsString().Or(""))
+        If Not diagnostics.Value("errors").IsArray() Then
+            record.Value("status") = "invalid-diagnostics"
+        ElseIf diagnostics.Value("errors").Count() <> 0 Then
+            record.Value("status") = "failed"
+        End If
+    Catch e As JSONException
+        record.Value("status") = "invalid-diagnostics"
+    End Try
+End Sub
+
+Function Collect(compiler As String) As JSONItem
+    Dim root As String = H.WorkspaceRoot()
+    Dim report As JSONItem = JSONItem.NewObject()
+    report.Value("schema_version") = 1.0
+    Dim host As JSONItem = JSONItem.NewObject()
+    host.Value("system") = String.Trim(H.Capture("uname -s"))
+    host.Value("machine") = String.Trim(H.Capture("uname -m"))
+    report.Value("host") = host
+    Dim capabilities As JSONItem = JSONItem.NewObject()
+    Dim names As Array Of String = ["buoy", "cc", "clang", "pkg-config", "xcrun", "codesign", "wine", "qemu-aarch64", "x86_64-w64-mingw32-gcc", "Xvfb", "docker", "ssh"]
+    For Each name As String In names
+        capabilities.Value(name) = ExecutableRecord(name)
+    Next
+    report.Value("tools") = capabilities
+    report.Value("compiler") = ExecutableRecord(compiler)
+    report.Value("native_compiler_candidate") = ExecutableRecord("/usr/bin/buoy")
+    Dim checks As JSONItem = JSONItem.NewArray()
+    Dim smoke As JSONItem = JSONItem.NewArray()
+    report.Value("target_checks") = checks
+    report.Value("native_smoke") = smoke
+    Dim limits As JSONItem = JSONItem.NewArray()
+    limits.Add("Target --check validates lex/parse/sema only; it does not link or execute foreign binaries.")
+    limits.Add("Native smoke validates a console program on this host only; GUI, services, and package bridges need dedicated tests.")
+    limits.Add("Tool availability does not establish a configured SDK, emulator, container daemon, remote host, or desktop session.")
+    report.Value("coverage_limits") = limits
+    Dim directory As String = H.TempDirectory("buoy-platform-audit-")
+    Try
+        Dim source As String = directory + "/main.bui"
+        H.WriteText(source, "Sub Main()\n    Print(\"platform-audit-ok\")\nEnd Sub\n")
+        Dim targets As Array Of String = ["arm64-darwin", "x86_64-darwin", "arm64-linux", "x86_64-linux", "arm64-windows", "x86_64-windows"]
+        For Each target As String In targets
+            Dim arguments As Array Of String = [compiler, source, "--check", "--diagnostic-format", "json", "--target", target]
+            Dim record As JSONItem = RunProbe(arguments, root, directory)
+            DiagnosticStatus(record)
+            record.Value("target") = target
+            checks.Add(record)
+        Next
+        Dim output As String = directory + "/probe"
+        Dim buildArguments As Array Of String = [compiler, source, "-o", output]
+        Dim build As JSONItem = RunProbe(buildArguments, root, directory)
+        smoke.Add(build)
+        If build.Value("status").AsString().Or("") = "passed" Then
+            Dim executeArguments As Array Of String = [output]
+            Dim execution As JSONItem = RunProbe(executeArguments, root, directory)
+            If execution.Value("status").AsString().Or("") = "passed" And String.Trim(execution.Value("stdout").AsString().Or("")) <> "platform-audit-ok" Then execution.Value("status") = "unexpected-output"
+            smoke.Add(execution)
+        End If
+    Finally
+        H.RemoveTree(directory)
+    End Try
+    Dim inventory As JSONItem = Json.Parse(H.ReadText(root + "/tests/workspace-audit/test-coverage.json"))
+    report.Value("offline_inventory_exclusions") = inventory.Value("gaps")
+    If Not inventory.HasKey("gaps") Then report.Value("offline_inventory_exclusions") = JSONItem.NewArray()
+    Dim steps As JSONItem = JSONItem.NewArray()
+    Dim actions As Array Of String = ["Run package consumers and GUI lifecycle tests in native macOS and Windows jobs; retain link and runtime evidence separately from target checks.", "Add arm64 Linux native or explicitly labelled emulator runtime evidence for package bridges.", "Register reviewed platform-safe suites in the curated inventory; its offline aggregate intentionally excludes GUI and artifact rebuilding runners."]
+    For i As Integer = 0 To actions.Count - 1
+        Dim stepRecord As JSONItem = JSONItem.NewObject()
+        stepRecord.Value("priority") = i + 1.0
+        stepRecord.Value("action") = actions(i)
+        steps.Add(stepRecord)
+    Next
+    report.Value("next_steps") = steps
+    Return report
+End Function
+
+Function Main(args As Array Of String) As Integer
+    Dim compiler As String = System.EnvironmentVariable("BUOY").Or("buoy")
+    Dim destination As String = ""
+    Dim i As Integer = 1
+    While i < args.Count
+        Dim argument As String = args(i)
+        If argument = "--help" Or argument = "-h" Then
+            Print("usage: platform_audit.bui [-h] [--compiler COMPILER] [--report REPORT]\n\nReport local platform capabilities; target checks do not establish native coverage.\nPOSIX host required (sh, uname, realpath, head, mktemp, rm).")
+            Return 0
+        ElseIf argument = "--compiler" Or argument = "--report" Then
+            i += 1
+            If i >= args.Count Then
+                StdErr.WriteLine("Missing value for " + argument)
+                Return 2
+            End If
+            If String.StartsWith(args(i), "--", True) Or args(i) = "-h" Then
+                StdErr.WriteLine("Missing value for " + argument)
+                Return 2
+            End If
+            If argument = "--compiler" Then
+                compiler = args(i)
+            Else
+                destination = args(i)
+            End If
+        ElseIf String.StartsWith(argument, "--compiler=", True) Then
+            compiler = String.Mid(argument, 12)
+        ElseIf String.StartsWith(argument, "--report=", True) Then
+            destination = String.Mid(argument, 10)
+        Else
+            StdErr.WriteLine("Unknown argument: " + argument)
+            Return 2
+        End If
+        i += 1
+    End While
+    Try
+        Dim report As JSONItem = Collect(compiler)
+        Dim options As New JSONOptions
+        options.Compact = False
+        options.IndentSpacing = 2
+        Dim rendered As String = Json.Stringify(report, options)
+        If destination = "" Then
+            Print(rendered)
+        Else
+            Dim file As New FileSystemItem(destination)
+            If file.Parent <> Nil Then H.MakeDirectory(file.Parent.FullPath())
+            H.WriteText(destination, rendered + "\n")
+        End If
+        Dim groups As Array Of String = ["target_checks", "native_smoke"]
+        For Each group As String In groups
+            Dim records As JSONItem = report.Value(group)
+            For j As Integer = 0 To records.Count() - 1
+                If records.ValueAt(j).Value("status").AsString().Or("") <> "passed" Then Return 1
+            Next
+        Next
+        Return 0
+    Catch e As Exception
+        StdErr.WriteLine(e.Message)
+        Return 1
+    End Try
+End Function

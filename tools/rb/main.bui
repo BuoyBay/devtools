@@ -1,0 +1,164 @@
+Import rbcodec
+Import rbcodec.RBProjectExport As ProjectExport
+Import rbcodec.RBProjectAssets As ProjectAssets
+
+Function ReadFile(filePath As String) As Bytes
+    Dim opened As Result Of BinaryStream, IOError = BinaryStream.Open(New FileSystemItem(filePath), False)
+    If opened.IsErr Then Throw New Exception("Cannot open input: " + filePath)
+    Dim stream As BinaryStream = opened.Value
+    Try
+        If stream.Length > 268435456 Then Throw New InvalidArgumentException("Input exceeds the 256 MiB CLI limit")
+        Dim size As Integer = stream.Length
+        Dim data As Bytes = stream.Read(size)
+        If data.Count <> size Or stream.LastError.HasValue Then Throw New Exception("Cannot read complete input: " + filePath)
+        Return data
+    Finally
+        stream.Close()
+    End Try
+End Function
+
+Sub WriteFile(filePath As String, data As Bytes)
+    Dim created As Result Of BinaryStream, IOError = BinaryStream.Create(New FileSystemItem(filePath))
+    If created.IsErr Then Throw New Exception("Cannot create output: " + filePath)
+    Dim stream As BinaryStream = created.Value
+    Try
+        stream.Write(data)
+        stream.Flush()
+        If stream.LastError.HasValue Then Throw New Exception("Cannot write output: " + filePath)
+    Finally
+        stream.Close()
+    End Try
+End Sub
+
+
+' mkdir itself must fail for every existing entry, including dangling symlinks.
+#If TargetWindows Then
+Declare Function ExclusiveDirectory Lib "msvcrt" Alias "_mkdir" (folderPath As String) As Int32
+#Else
+Declare Function NativeDirectory Lib "c" Alias "mkdir" (folderPath As String, mode As UInt32) As Int32
+#End If
+
+Function CreateExclusiveDirectory(folderPath As String) As Boolean
+    #If TargetWindows Then
+    Return ExclusiveDirectory(folderPath) = 0
+    #Else
+    Return NativeDirectory(folderPath, 448) = 0
+    #End If
+End Function
+
+Sub ExportProject(inputPath As String, destinationPath As String)
+    ' Complete import and pure planning before creating any output.
+    Dim original As Bytes = ReadFile(inputPath)
+    Dim report As JSONItem = ImportProject(original)
+    Dim assets As JSONItem = ProjectAssets.InspectProjectAssets(report.Value("document"))
+    Dim plan As JSONItem = ProjectExport.PlanProjectExport(report, inputPath, assets)
+    Dim destination As New FileSystemItem(destinationPath)
+    If destination.Name() = "" Or destination.Name() = "." Or destination.Name() = ".." Then Throw New InvalidArgumentException("Expected a new directory with a leaf name")
+    Dim stage As New FileSystemItem(destinationPath + ".rb-export-staging")
+    If Not CreateExclusiveDirectory(stage.FullPath()) Then Throw New Exception("Cannot reserve export staging directory: " + stage.FullPath())
+    Dim reservedDestination As Boolean = False
+    Try
+        WriteFile(stage.Child("original.rbbin").FullPath(), original)
+        Dim files As JSONItem = plan.Value("files")
+        For i As Integer = 0 To files.Count() - 1
+            Dim file As JSONItem = files.ValueAt(i)
+            WriteFile(stage.Child(file.Value("path").AsString().Value).FullPath(), Bytes.FromString(file.Value("contents").AsString().Value, Text.Encodings.UTF8))
+        Next
+        Dim manifest As JSONItem = plan.Value("manifest")
+        manifest.Value("originalBytes") = original.Count
+        WriteFile(stage.Child("manifest.json").FullPath(), Bytes.FromString(Json.Stringify(manifest), Text.Encodings.UTF8))
+        If Not CreateExclusiveDirectory(destinationPath) Then Throw New Exception("Export requires a new directory; existing entries and symlinks are refused: " + destinationPath)
+        reservedDestination = True
+        ' Publish the manifest last. Without it the directory is never complete.
+        For Each child As FileSystemItem In stage.Children()
+            If child.Name() <> "manifest.json" Then
+                If Not child.MoveTo(destination.Child(child.Name())) Then Throw New Exception("Cannot publish export file")
+            End If
+        Next
+        If Not stage.Child("manifest.json").MoveTo(destination.Child("manifest.json.pending")) Then Throw New Exception("Cannot stage export manifest")
+        If Not stage.Delete() Then Throw New Exception("Cannot remove export staging directory")
+        If Not destination.Child("manifest.json.pending").MoveTo(destination.Child("manifest.json")) Then Throw New Exception("Cannot publish export manifest")
+    Catch e As Exception
+        If reservedDestination Then destination.Delete(True)
+        stage.Delete(True)
+        Throw e
+    End Try
+    Print "Exported read-only RB project: " + destinationPath
+End Sub
+
+Sub Main(args As Array Of String)
+    Dim count As Integer = Array.Count(args) - 1
+    If count = 0 Then
+        Print "RB IDE clipboard codec"
+        Print "  rbcodec capture source.rbcode  Capture source plus a .rbclip metadata companion"
+        Print "  rbcodec copy source.rbcode     Encode edited source and copy it to the IDE clipboard"
+        Print "  rbcodec decode input.bin source   Decode source plus a .rbbin metadata companion"
+        Print "  rbcodec encode source output.bin  Encode source using its .rbbin companion"
+        Print "  rbcodec capture-native resources.json  Snapshot every native clipboard flavor"
+        Print "  rbcodec copy-binary input.bin         Publish a binary selection or exported App object"
+        Print "  rbcodec copy-native resources.json     Restore all saved native flavors"
+        Print "  rbcodec inspect input.bin tree.json  Inspect the lossless binary tree"
+        Print "  rbcodec import-project project.xojo_binary_project report.json"
+        Print "  rbcodec export-project project.xojo_binary_project NEW_DIRECTORY"
+        Print "  rbcodec inspect-assets project.xojo_binary_project assets.json"
+        Print "  rbcodec new-member Meth source     Build a new member from source and copy its binary"
+        Print "  rbcodec build-member Meth source output.bin"
+        Exit Sub
+    End If
+    Dim command As String = args(1)
+    If command = "capture" And count = 2 Then
+        Dim session As RBClipboardSource = CaptureSourceClipboard()
+        WriteFile(args(2), Bytes.FromString(session.Source, Text.Encodings.UTF8))
+        WriteFile(args(2) + ".rbclip", Bytes.FromString(session.TemplateText(), Text.Encodings.UTF8))
+        Print "Captured RB source: " + args(2)
+    ElseIf command = "copy" And count = 2 Then
+        Dim session As RBClipboardSource = OpenSourceTemplate(ReadFile(args(2) + ".rbclip").ToString(Text.Encodings.UTF8))
+        session.Source = ReadFile(args(2)).ToString(Text.Encodings.UTF8)
+        session.Copy()
+        Print "Encoded RB source and copied the IDE binary; paste it into RB."
+    ElseIf command = "decode" And count = 3 Then
+        Dim original As Bytes = ReadFile(args(2))
+        Dim encodedText As String = BinaryToSource(original)
+        WriteFile(args(3), Bytes.FromString(encodedText, Text.Encodings.UTF8))
+        WriteFile(args(3) + ".rbbin", original)
+    ElseIf command = "encode" And count = 3 Then
+        Dim data As Bytes = SourceToBinary(ReadFile(args(2)).ToString(Text.Encodings.UTF8), ReadFile(args(2) + ".rbbin"))
+        WriteFile(args(3), data)
+    ElseIf command = "new-member" And count = 3 Then
+        MemberSourceToClipboard(args(2), ReadFile(args(3)).ToString(Text.Encodings.UTF8))
+        Print "Built a new RB member from source; paste it into a class or module."
+    ElseIf command = "build-member" And count = 4 Then
+        Dim data As Bytes = MemberSourceToBinary(args(2), ReadFile(args(3)).ToString(Text.Encodings.UTF8))
+        WriteFile(args(4), data)
+    ElseIf command = "export-project" And count = 3 Then
+        ExportProject(args(2), args(3))
+    ElseIf command = "inspect-assets" And count = 3 Then
+        Dim report As JSONItem = ImportProject(ReadFile(args(2)))
+        WriteFile(args(3), Bytes.FromString(Json.Stringify(ProjectAssets.InspectProjectAssets(report.Value("document"))), Text.Encodings.UTF8))
+    ElseIf command = "import-project" And count = 3 Then
+        Dim report As JSONItem = ImportProject(ReadFile(args(2)))
+        WriteFile(args(3), Bytes.FromString(Json.Stringify(report), Text.Encodings.UTF8))
+    ElseIf command = "inspect" And count = 3 Then
+        Dim encodedText As String = BinaryToText(ReadFile(args(2)))
+        WriteFile(args(3), Bytes.FromString(encodedText, Text.Encodings.UTF8))
+    ElseIf command = "encode-json" And count = 3 Then
+        Dim data As Bytes = TextToBinary(ReadFile(args(2)).ToString(Text.Encodings.UTF8))
+        WriteFile(args(3), data)
+    ElseIf command = "copy-binary" And count = 2 Then
+        BinaryToClipboard(ReadFile(args(2)))
+        Print "Copied validated RB binary; paste into the IDE."
+    ElseIf command = "capture-native" And count = 2 Then
+        WriteFile(args(2), Bytes.FromString(CaptureNativeResources(), Text.Encodings.UTF8))
+        Print "Captured every offered native clipboard flavor."
+    ElseIf command = "copy-native" And count = 2 Then
+        RestoreNativeResources(ReadFile(args(2)).ToString(Text.Encodings.UTF8))
+        Print "Restored all saved native clipboard flavors."
+    ElseIf command = "capture-json" And count = 2 Then
+        Dim encodedText As String = ClipboardToText()
+        WriteFile(args(2), Bytes.FromString(encodedText, Text.Encodings.UTF8))
+    ElseIf command = "copy-json" And count = 2 Then
+        TextToClipboard(ReadFile(args(2)).ToString(Text.Encodings.UTF8))
+    Else
+        Throw New InvalidArgumentException("Expected capture/copy <source> or decode/encode <input> <output>")
+    End If
+End Sub

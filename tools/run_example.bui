@@ -1,0 +1,205 @@
+Import helper_runtime As H
+
+' GNU/Linux host runner: requires realpath, cp, mktemp and the POSIX shell.
+Private Function Canonical(value As String) As String
+    Return String.Trim(H.Capture("realpath -m -- " + H.Q(value)))
+End Function
+
+Private Function Inside(root As String, value As String) As String
+    Dim resolved As String = Canonical(value)
+    If resolved <> root And Not String.StartsWith(resolved, root + "/", True) Then
+        Throw New RuntimeException("Path must stay inside the workspace: " + resolved)
+    End If
+    Return resolved
+End Function
+
+Private Sub CopyFile(source As String, destination As String)
+    Dim file As New FileSystemItem(destination)
+    H.MakeDirectory(file.ParentPath())
+    H.RequireRun("cp -p -- " + H.Q(source) + " " + H.Q(destination))
+End Sub
+
+Private Sub ValidateTree(root As String, filename As String, ancestors As String)
+    Dim resolved As String = Inside(root, filename)
+    If String.InStr(ancestors, "\n" + resolved + "\n") > 0 Then Throw New RuntimeException("Cyclic asset symlink: " + resolved)
+    ancestors += "\n" + resolved + "\n"
+    Dim item As New FileSystemItem(resolved)
+    If item.IsFolder() Then
+        For Each child As FileSystemItem In item.Children()
+            ValidateTree(root, child.FullPath(), ancestors)
+        Next
+    End If
+End Sub
+
+Private Function Stage(root As String, source As String, work As String, assets As Array Of String) As String
+    Dim pending As Array Of String = []
+    pending.Append(source)
+    Dim visited As String = ""
+    Dim cursor As Integer = 0
+    While cursor < pending.Count
+        Dim current As String = Inside(root, pending(cursor))
+        cursor += 1
+        If String.InStr(visited, "\n" + current + "\n") > 0 Then Continue While
+        Dim item As New FileSystemItem(current)
+        If Not item.IsFile() Then Throw New RuntimeException("Source import does not exist: " + current)
+        visited += "\n" + current + "\n"
+        CopyFile(current, work + String.Substring(current, String.Len(root)))
+        For Each sibling As String In H.Sources(item.ParentPath())
+            pending.Append(sibling)
+        Next
+        For Each line As String In String.Split(H.ReadText(current), "\n")
+            Dim trimmed As String = String.Trim(line)
+            If String.Len(trimmed) < 7 Then Continue For
+            If String.LCase(String.Substring(trimmed, 0, 6)) <> "import" Then Continue For
+            Dim separator As String = String.Substring(trimmed, 6, 1)
+            If separator <> " " And separator <> "\t" Then Continue For
+            Dim rest As String = String.Trim(String.Substring(trimmed, 6))
+            If Not String.StartsWith(rest, "\"", True) Then Continue For
+            Dim parts As Array Of String = String.Split(rest, "\"")
+            If parts.Count < 3 Then Continue For
+            Dim dependency As String = parts(1)
+            If Not String.EndsWith(dependency, ".bui", True) Then dependency += ".bui"
+            pending.Append(Path.Join(item.ParentPath(), dependency))
+        Next
+    End While
+    H.MakeDirectory(Path.Join(work, "packages"))
+    For Each archive As String In H.Sources(Path.Join(root, "packages"), "", ".buipkg")
+        Dim item As New FileSystemItem(archive)
+        CopyFile(archive, Path.Join(work, "packages/" + item.Name()))
+    Next
+    For Each asset As String In assets
+        Dim resolved As String = Inside(root, asset)
+        Dim item As New FileSystemItem(resolved)
+        Dim destination As String = work + String.Substring(resolved, String.Len(root))
+        If item.IsFolder() Then
+            ValidateTree(root, resolved, "")
+            H.MakeDirectory(destination)
+            H.RequireRun("cp -RLp -- " + H.Q(resolved + "/.") + " " + H.Q(destination))
+        ElseIf item.IsFile() Then
+            CopyFile(resolved, destination)
+        Else
+            Throw New RuntimeException("Asset does not exist: " + resolved)
+        End If
+    Next
+    Return work + String.Substring(source, String.Len(root))
+End Function
+
+Private Function Process(command As String, cwd As String, timeout As Integer, output As String, errors As String) As Integer
+    Dim shell As New Shell
+    shell.Timeout = timeout * 1000
+    Try
+        Dim prefix As String = ""
+        If cwd <> "" Then prefix = "cd " + H.Q(cwd) + " && "
+        shell.Execute(prefix + command + " > " + H.Q(output) + " 2> " + H.Q(errors))
+        Return shell.LastExitCode
+    Finally
+        If shell.IsRunning Then shell.Kill()
+        shell.Close()
+    End Try
+End Function
+
+Function Main(args As Array Of String) As Integer
+    Dim work As String = ""
+    Try
+        Dim source As String = ""
+        Dim output As String = ""
+        Dim target As String = ""
+        Dim assets As Array Of String = []
+        Dim arguments As Array Of String = []
+        Dim run As Boolean = False
+        Dim timeout As Integer = 120
+        Dim i As Integer = 1
+        While i < args.Count
+            Dim arg As String = args(i)
+            If arg = "--help" Or arg = "-h" Then
+                Print "Usage: run_example.bui SOURCE [-o DIRECTORY] [--target TRIPLE] [--asset PATH] [--run] [--timeout SECONDS] [--args ...]"
+                Return 0
+            ElseIf arg = "--run" Then
+                run = True
+            ElseIf arg = "--args" Then
+                i += 1
+                While i < args.Count
+                    arguments.Append(args(i))
+                    i += 1
+                End While
+                Exit While
+            ElseIf arg = "-o" Or arg = "--output" Or arg = "--target" Or arg = "--asset" Or arg = "--timeout" Then
+                i += 1
+                If i >= args.Count Then Throw New RuntimeException("Missing value for " + arg)
+                Select Case arg
+                Case "-o", "--output"
+                    output = args(i)
+                Case "--target"
+                    target = args(i)
+                Case "--asset"
+                    assets.Append(args(i))
+                Case "--timeout"
+                    If args(i) = "" Then Throw New RuntimeException("--timeout must be positive")
+                    For n As Integer = 0 To String.Len(args(i)) - 1
+                        Dim digit As String = String.Substring(args(i), n, 1)
+                        If String.InStr("0123456789", digit) = 0 Then Throw New RuntimeException("--timeout must be positive")
+                    Next
+                    timeout = Integer.Parse(args(i)).Value
+                End Select
+            ElseIf String.StartsWith(arg, "-", True) Or source <> "" Then
+                Throw New RuntimeException("Unexpected argument: " + arg)
+            Else
+                source = arg
+            End If
+            i += 1
+        End While
+        Dim root As String = Canonical(H.WorkspaceRoot())
+        If timeout <= 0 Or timeout > 2147483 Then Throw New RuntimeException("--timeout must be between 1 and 2147483")
+        If run And target <> "" Then Throw New RuntimeException("--run requires a host build; omit --target")
+        If arguments.Count > 0 And Not run Then Throw New RuntimeException("--args requires --run")
+        If source = "" Then Throw New RuntimeException("Source is required")
+        source = Inside(Path.Join(root, "examples"), source)
+        Dim entry As New FileSystemItem(source)
+        If Not entry.IsFile() Or Not String.EndsWith(source, ".bui", True) Then Throw New RuntimeException("Example must be an existing .bui file")
+        Dim name As String = String.Substring(entry.Name(), 0, String.Len(entry.Name()) - 4)
+        If name = "main" Then name = entry.Parent.Name()
+        If output = "" Then output = Path.Join(root, "dist/examples/" + name)
+        output = Canonical(output)
+        work = H.TempDirectory("buoy-example-")
+        Dim local As String = Stage(root, source, work, assets)
+        Dim compiler As String = System.EnvironmentVariable("BUOY").Or("buoy")
+        Dim targetFlags As String = ""
+        If target <> "" Then targetFlags = " --target " + H.Q(target)
+        Dim outFile As String = Path.Join(work, "outFile")
+        Dim errFile As String = Path.Join(work, "errFile")
+        Dim status As Integer = Process(H.Q(compiler) + " " + H.Q(local) + " --check --diagnostic-format json" + targetFlags, work, timeout, outFile, errFile)
+        StdErr.Write(H.ReadText(errFile))
+        Dim diagnostics As JSONItem = Json.Parse(H.ReadText(outFile))
+        If Not diagnostics.IsObject() Then Throw New RuntimeException("Compiler diagnostics must be a JSON object")
+        If Not diagnostics.Value("errors").IsArray() Then Throw New RuntimeException("Compiler diagnostics errors must be a JSON array")
+        If status <> 0 Or diagnostics.Value("errors").Count() > 0 Then Throw New RuntimeException("Example check failed: " + H.ReadText(outFile))
+        If diagnostics.Value("warnings").Count() > 0 Then StdErr.WriteLine(Json.Stringify(diagnostics.Value("warnings")))
+        Dim products As String = Path.Join(work, "build")
+        H.MakeDirectory(products)
+        Dim binary As String = "example"
+        If String.InStr(target, "windows") > 0 Then binary += ".exe"
+        status = Process(H.Q(compiler) + " " + H.Q(local) + " -o " + H.Q(Path.Join(products, binary)) + targetFlags, work, timeout, outFile, errFile)
+        StdOut.Write(H.ReadText(outFile))
+        StdErr.Write(H.ReadText(errFile))
+        If status <> 0 Then Throw New RuntimeException("Example build failed with exit " + Str(status))
+        H.MakeDirectory(output)
+        H.RequireRun("cp -Rp -- " + H.Q(products + "/.") + " " + H.Q(output))
+        Print "Built " + Path.Join(output, binary)
+        If run Then
+            Dim command As String = H.Q(Path.Join(output, binary))
+            For Each arg As String In arguments
+                command += " " + H.Q(arg)
+            Next
+            status = Process(command, "", timeout, outFile, errFile)
+            StdOut.Write(H.ReadText(outFile))
+            StdErr.Write(H.ReadText(errFile))
+            Return status
+        End If
+        Return 0
+    Catch e As Exception
+        StdErr.WriteLine("Example build failed: " + e.Message)
+        Return 1
+    Finally
+        If work <> "" Then H.RemoveTree(work)
+    End Try
+End Function
