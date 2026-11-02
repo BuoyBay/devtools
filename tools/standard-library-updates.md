@@ -63,7 +63,6 @@ checker or a pin, on manual dispatch, and every Monday at 12:17 UTC. It has
 `contents: read` and uploads `standard-library-updates.json`. It uses no
 custom secrets and does not create issues or pull requests.
 
-
 Offline fixtures model the current Unicode 18 pin and a synthetic Unicode 19
 release and prerelease. The Unicode 19 fixtures are test inputs, not claims that
 such a release exists. Historical Unicode 17 announcement boilerplate remains
@@ -74,5 +73,3 @@ command means a newer stable release was listed. Exit 1 means the check did not
 complete. The source records are still unchanged. Updating TimeZoneKit, CLDR mappings,
 CompressionKit, or NormalizationKit remains a separate reviewed change to those
 records and their generated tables.
-
-Test suites and fixtures are maintainer-local and are not part of this public repository.

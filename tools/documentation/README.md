@@ -10,8 +10,9 @@ version 1 contract, supported Markdown/front matter, and resource limits.
 Add UTF-8 Markdown and relative PNG/JPEG/GIF/WebP images under a library's
 `resources/buoy-docs/` directory. Start with `index.md`, link to a getting started
 guide and an API reference, and use headings for the page outline. Folder
-`index.md` files name breadcrumb parents. Code fences can specify `buoy`, `json`,
-or another language; the shared reader supplies code styling and copy buttons.
+`index.md` files name breadcrumb parents. Code fences can specify `basic` (for
+Buoy source), `json`, or another language; `basic` is the GitHub/Linguist alias
+the reader maps to Buoy. The shared reader supplies code styling and copy buttons.
 Packages never supply CSS, scripts, fonts, or reader layouts.
 
 Make getting-started examples reproducible in a fresh consumer project. Name the
@@ -74,57 +75,35 @@ along with the package's other resources.
 The [greetings example](https://github.com/BuoyBay/bpm/blob/main/src/examples/hello/greetings/resources/buoy-docs/index.md)
 demonstrates an overview, guide, API hierarchy, metadata, links, and a code block.
 
-## Index installed documentation
+## Index documentation
+
+`tools/discover_documentation.bui` reads a project and a supplied upstream
+snapshot and writes a searchable index. From an assembled integration workspace
+with buoy-run and the required SDK archives available:
 
 ```sh
-python3 tools/discover_documentation.py --project . \
-  --snapshot apps/BuoyDocs/snapshot/docs.json --output .buoy/docs/index.json
+buoy-run tools/discover_documentation.bui --project "$PROJECT_ROOT" \
+  --snapshot "$DOCUMENTATION_SNAPSHOT" --output "$OUTPUT_INDEX"
 ```
 
-The input upstream snapshot is checked into this repository. Refresh it from an
-installed Buoy toolchain using `tools/index_buoy_docs.cjs` as described in the
-Buoy Docs README (not included in this repository). Discovery itself needs only
-Python's standard library and never fetches anything from the network.
-
-## Build a documentation website
-
-The result is one self-contained `index.html` with embedded content, images, and
-search postings. It works offline or on static hosting, uses the same system
-theme as Studio, and needs no JavaScript package installation or server runtime.
-Builder filesystem paths are omitted from the public output. The source build
-uses temporary documentation-only importer inputs; these are never installed or
-published as compiler packages. The website is an export artifact, ready for a
-future BPM website to host; this tool does not deploy it.
-
-## Verify
-
-```sh
-PYTHONPATH=tests python3 -m unittest test_bpm_documentation -v
-```
-
-Package coverage requires an overview, guide, API reference, summaries, indexed
-symbols, valid internal links, and a clean import beside the upstream corpus.
+Set those paths to your project, a compatible documentation snapshot and the
+output location. Use `--global-dir` for an additional package-documentation root.
+The reader uses the format described in [FORMAT.md](FORMAT.md).
 
 ## Maintain typed package references
 
+`tools/generate_api_documentation.bui` derives API reference material from package
+source. Run its help from the combined source workspace to select a library,
+root and output/check mode:
+
 ```sh
-node tests/documentation_viewer_test.cjs
+buoy-run tools/generate_api_documentation.bui --help
 ```
 
-The generator reads declarations from all source package manifests, preserving
-existing overview/guide/contracts and adding `typed-api.md` with property flags,
-one parameter per row, exact defaults, and return types. It uses the compiler to
-reseal archives so documentation resources and package digests stay consistent.
-Review the generated changes before distribution. Native libraries are not rebuilt.
-
-UpdateKit is excluded from bulk archive synchronization during native QA.
-`tools/build_updatekit.py` owns its validated slice receipts and macOS dylib
-assembly. Source documentation maintenance may continue; the documentation
-generator leaves `packages/updatekit-0.1.0.buipkg` untouched until that ownership
-hold is explicitly handed off.
-See FORMAT.md for linked keywords/types, callouts, heading and line-range links,
-clipboard controls, and the `shareBaseUrl` hosting option.
-
+Review generated declarations, signatures, links and resource changes before
+releasing the package. Rebuilding native backends remains the responsibility of
+the package's native builder. The source documentation tooling does not establish
+that a native library has been rebuilt or validated.
 
 ## Keyboard and accessibility review
 
@@ -135,15 +114,11 @@ The native documentation window exposes Find, Find Next/Previous, global search,
 history, text size, reserved words, and keyboard help through menus as well as the
 reader controls. The complete bindings are documented in [FORMAT.md](FORMAT.md#search-keyboard-access-and-reading-controls).
 
-Keyboard regression tests cover Mac, Windows, and Linux modifier conventions,
-page/line scrolling, find navigation, and editing-field protection. Copy controls
+Keyboard controls follow the platform's modifier conventions and preserve editing-field behavior. Copy controls
 have accessible names; dialogs trap focus and close with Escape; navigation moves
 focus into the article; API tables expose row/column headers and scroll regions.
 Code references use a single keyboard-accessible chooser per block. Reading text
 can scale to 200% without scaling the surrounding controls.
 
-DOM tests and cross-target compiler checks do not verify VoiceOver, native
-Accessibility Inspector output, or physical macOS/Windows keyboard behavior.
-Those live platform checks remain unverified on the Linux validation host.
-
-Test suites and fixtures are maintainer-local and are not part of this public repository.
+Validate screen-reader output, native accessibility properties and physical
+keyboard behavior on the target platform when those features are required.

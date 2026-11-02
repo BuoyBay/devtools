@@ -1,7 +1,6 @@
 # Python policy for devtools
 
 Python files are ignored by default. New production tooling belongs in Buoy or BuoyScript.
-Generated/local validation helpers stay on the maintainer machine and are not public source.
 
 The following exact files remain temporary production compatibility exceptions:
 
@@ -18,7 +17,7 @@ The following exact files remain temporary production compatibility exceptions:
 | `tools/build_gitkit.py` | Rebuilds GitKit native Git bridge slices and verifies their target receipts. |
 | `tools/build_keychain.py` | Builds the platform credential-store native bridges; generic source sealing cannot rebuild these. |
 | `tools/build_odbckit.py` | Builds the ODBC native bridge and validates its source/binary receipt before sealing. |
-| `tools/build_previewkit.py` | Private PreviewKit source-stage adapter imported by the retained RBClassic build; pure source package builds use the native driver. |
+| `tools/build_previewkit.py` | PreviewKit source-stage adapter imported by the retained RBClassic build; pure source package builds use the native driver. |
 | `tools/build_processkit.py` | Rebuilds ProcessKit native process bridge slices for package/release targets not covered by Linux tool bootstrap. |
 | `tools/build_rbclassic.py` | Stages the REALbasic compatibility package with platform adapters and verified ProcessKit/lifecycle dependencies. |
 | `tools/build_renderprocess.py` | Compiles the native preview render-process bridge for the selected target. |
@@ -41,7 +40,7 @@ The following exact files remain temporary production compatibility exceptions:
 | `tools/font_package_artifacts.py` | Shared font/shaping/text native slice receipts and architecture verification imported by retained native builders. |
 | `tools/studio_build_info.py` | Build identity/resource generation required by the retained Studio platform build fallback. |
 | `tools/studio_debug_adapter.py` | Bundled Studio runtime DAP bridge; current debugger starts this helper explicitly. |
-| `tools/studio_release_packages.py` | Private SDK staging implementation used by retained Studio release builds; invokes explicit native package recipes. |
+| `tools/studio_release_packages.py` | Per-target SDK staging implementation used by retained Studio release builds; invokes explicit native package recipes. |
 | `tools/updatekit_licenses.py` | Imported production dependency of build_updatekit.py; retained until that entrypoint and its dependency are ported together. |
 | `tools/updatekit_release.py` | Current release artifact publication/signing orchestration for UpdateKit; not covered by native source build tooling. |
 

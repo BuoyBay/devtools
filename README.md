@@ -1,4 +1,4 @@
-# Native build tools for Buoy packages and applications
+# Native package and application build drivers, with isolated staging and compiler checks
 
 These tools stage source and dependency archives, run the Buoy compiler with
 literal argument arrays, and build packages or applications in isolated work
@@ -41,7 +41,5 @@ On your own machine, install Buoy and run:
 ```sh
 buoy ai init --both
 ```
-
-The generated agent files and editor settings stay local and are ignored by Git.
 
 [Contributing](CONTRIBUTING.md) · [License](LICENSE)

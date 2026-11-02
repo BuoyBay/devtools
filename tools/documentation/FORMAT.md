@@ -95,7 +95,8 @@ with a separator row, inline code, single/double-asterisk emphasis, inline links
 and images, blockquotes, thematic breaks, and fenced code using backticks or tildes.
 Consecutive ordinary source lines form one paragraph; the viewer controls wrapping.
 Fences retain an optional
-ASCII language identifier as `class="language-buoy"`, for example. Code is escaped
+ASCII language identifier as `class="language-basic"`, for example. The viewer
+treats `basic` as Buoy. Code is escaped
 and emitted as `pre > code`; the viewer supplies highlighting and copy controls
 from code text. Source headings remain in the page. Nested Markdown, reference
 links, escaped table pipes, link titles, and nested blockquotes are
@@ -161,8 +162,6 @@ These are resource ceilings, not proof that an archive is authentic; BPM owns
 installation provenance. Concurrent hostile filesystem replacement is outside this
 helper's static-path checks; callers should use package roots they control.
 
-Maintainers run the private validation suite before release. See the repository README for public build instructions.
-
 ## API layout and reader controls
 
 `python3 tools/generate_api_documentation.py --sync-archives` maintains a typed
@@ -222,7 +221,6 @@ Use GitHub-style blockquote callouts in both upstream and package Markdown:
 Supported labels: NOTE, TIP, IMPORTANT, WARNING, CAUTION, DEPRECATED. Labels remain
 visible and accessible independent of color. Callouts do not execute authored HTML.
 
-
 ### Search, keyboard access, and reading controls
 
 Global search ranks exact definitions before prose matches and opens member results
@@ -245,7 +243,6 @@ both definition indexing and keyword catalog generation. Run
 `python3 tools/audit_documentation_keywords.py --verify` after a toolchain change
 to recheck reserved status using the compiler. Reserved status alone does not
 imply implemented statement syntax.
-
 
 Large source-derived references use `typed-api.md` as an index and place each
 type or module-function group under `typed-api/`. Each page keeps its complete
