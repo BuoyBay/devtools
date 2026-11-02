@@ -34,12 +34,4 @@ libraries beside the output binary. Source audits, documentation helpers and
 remaining platform-specific adapters live under `tools/`; their names and
 requirements are documented with each entrypoint.
 
-## Local Buoy setup
-
-On your own machine, install Buoy and run:
-
-```sh
-buoy ai init --both
-```
-
 [Contributing](CONTRIBUTING.md) · [License](LICENSE)
