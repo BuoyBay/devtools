@@ -1,4 +1,4 @@
-# Native package and application build drivers, with isolated staging and compiler checks
+# Native package and app build drivers, isolated staging
 
 These tools stage source and dependency archives, run the Buoy compiler with
 literal argument arrays, and build packages or applications in isolated work
